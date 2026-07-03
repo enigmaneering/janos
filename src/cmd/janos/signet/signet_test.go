@@ -11,9 +11,9 @@ import (
 
 const validSignet = `# comment line
 guild_pubkey     = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
-guild_signer     = gcpkms://projects/guild-root/locations/global/keyRings/janos/cryptoKeys/root/cryptoKeyVersions/1
+guild_diviner     = gcpkms://projects/guild-root/locations/global/keyRings/janos/cryptoKeys/root/cryptoKeyVersions/1
 release_pubkey   = 2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
-release_signer   = gcpkms://projects/janos/locations/global/keyRings/releases/cryptoKeys/janos-1-26/cryptoKeyVersions/1
+release_diviner   = gcpkms://projects/janos/locations/global/keyRings/releases/cryptoKeys/janos-1-26/cryptoKeyVersions/1
 release_parent_cert = 41414141414141414141414141414141414141414141414141414141414141414242424242424242424242424242424242424242424242424242424242424242
 release_epoch    = 7
 `
@@ -26,8 +26,8 @@ func TestParseValid(t *testing.T) {
 	if c.GuildPubKey[0] != 0x01 || c.GuildPubKey[31] != 0x20 {
 		t.Errorf("guild_pubkey not decoded: %x", c.GuildPubKey)
 	}
-	if !strings.HasPrefix(c.GuildSigner, "gcpkms://") {
-		t.Errorf("guild_signer: %q", c.GuildSigner)
+	if !strings.HasPrefix(c.GuildDiviner, "gcpkms://") {
+		t.Errorf("guild_diviner: %q", c.GuildDiviner)
 	}
 	if c.ReleasePubKey[0] != 0x21 || c.ReleasePubKey[31] != 0x40 {
 		t.Errorf("release_pubkey not decoded: %x", c.ReleasePubKey)
@@ -46,7 +46,7 @@ func TestParseValid(t *testing.T) {
 func TestParseRejectFileScheme(t *testing.T) {
 	f := `guild_pubkey = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 release_pubkey = 2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
-release_signer = file:///tmp/leaked.pem
+release_diviner = file:///tmp/leaked.pem
 release_parent_cert = 41414141414141414141414141414141414141414141414141414141414141414242424242424242424242424242424242424242424242424242424242424242
 `
 	c, err := Parse(strings.NewReader(f))
@@ -61,11 +61,11 @@ release_parent_cert = 4141414141414141414141414141414141414141414141414141414141
 }
 
 func TestParseRejectUnknownScheme(t *testing.T) {
-	f := `release_signer = badscheme://whatever
+	f := `release_diviner = badscheme://whatever
 `
 	c, _ := Parse(strings.NewReader(f))
-	if err := validateSignerScheme(c.ReleaseSigner); err == nil {
-		t.Error("validateSignerScheme accepted badscheme://")
+	if err := validateDivinerScheme(c.ReleaseDiviner); err == nil {
+		t.Error("validateDivinerScheme accepted badscheme://")
 	}
 }
 
@@ -116,16 +116,16 @@ func TestValidateForBuildDetailedErrors(t *testing.T) {
 		want string
 	}{
 		{"missing guild pubkey", `release_pubkey = 2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
-release_signer = gcpkms://x
+release_diviner = gcpkms://x
 release_parent_cert = 41414141414141414141414141414141414141414141414141414141414141414242424242424242424242424242424242424242424242424242424242424242`,
 			"guild_pubkey"},
 		{"missing release signer", `guild_pubkey = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 release_pubkey = 2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
 release_parent_cert = 41414141414141414141414141414141414141414141414141414141414141414242424242424242424242424242424242424242424242424242424242424242`,
-			"release_signer"},
+			"release_diviner"},
 		{"missing release parent cert", `guild_pubkey = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 release_pubkey = 2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40
-release_signer = gcpkms://ok`,
+release_diviner = gcpkms://ok`,
 			"release_parent_cert"},
 	}
 	for _, tc := range cases {

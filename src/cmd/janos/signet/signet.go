@@ -34,22 +34,22 @@ type Config struct {
 	// file; decoded on load.
 	GuildPubKey [32]byte
 
-	// GuildSigner is the KMS URL of the Guild's root signing key.
+	// GuildDiviner is the KMS URL of the Guild's root signing key.
 	// Only invoked during release-ceremony builds; regular builds
 	// don't call it.  Empty string means "not a release ceremony
 	// build" — cmd/link will refuse to build if this is required
 	// (e.g., when producing a new release_pubkey signature) but
 	// otherwise ignores it.
-	GuildSigner string
+	GuildDiviner string
 
 	// ReleasePubKey is the 32-byte Ed25519 public key of this
 	// release's signing keypair.
 	ReleasePubKey [32]byte
 
-	// ReleaseSigner is the KMS URL for this release's signing key.
+	// ReleaseDiviner is the KMS URL for this release's signing key.
 	// cmd/link invokes it on every build.  Must be a non-file://
 	// scheme in production; presence of file:// causes a link error.
-	ReleaseSigner string
+	ReleaseDiviner string
 
 	// ReleaseParentCert is Guild's Ed25519 signature over
 	// ReleasePubKey — the chain-of-trust link that lets Release
@@ -66,7 +66,7 @@ type Config struct {
 // Load reads and parses the signet file at path.  Returns a
 // populated Config or an error explaining the first problem
 // encountered.  A missing file, wrong-length hex value, or
-// unrecognized scheme in a signer URL is a fatal error.
+// unrecognized scheme in a diviner URL is a fatal error.
 func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -101,14 +101,14 @@ func Parse(r io.Reader) (*Config, error) {
 			if err := decodeHex32(val, &c.GuildPubKey); err != nil {
 				return nil, fmt.Errorf("signet: line %d guild_pubkey: %w", lineno+1, err)
 			}
-		case "guild_signer":
-			c.GuildSigner = val
+		case "guild_diviner":
+			c.GuildDiviner = val
 		case "release_pubkey":
 			if err := decodeHex32(val, &c.ReleasePubKey); err != nil {
 				return nil, fmt.Errorf("signet: line %d release_pubkey: %w", lineno+1, err)
 			}
-		case "release_signer":
-			c.ReleaseSigner = val
+		case "release_diviner":
+			c.ReleaseDiviner = val
 		case "release_parent_cert":
 			releaseParentCertHex = val
 		case "release_epoch":
@@ -149,11 +149,11 @@ func (c *Config) ValidateForBuild() error {
 	if c.ReleasePubKey == ([32]byte{}) {
 		return errors.New("signet: release_pubkey is empty; cannot bake a Release identity into the runtime")
 	}
-	if c.ReleaseSigner == "" {
-		return errors.New("signet: release_signer KMS URL is empty; cannot sign this build")
+	if c.ReleaseDiviner == "" {
+		return errors.New("signet: release_diviner KMS URL is empty; cannot sign this build")
 	}
-	if err := validateSignerScheme(c.ReleaseSigner); err != nil {
-		return fmt.Errorf("signet: release_signer: %w", err)
+	if err := validateDivinerScheme(c.ReleaseDiviner); err != nil {
+		return fmt.Errorf("signet: release_diviner: %w", err)
 	}
 	if c.ReleaseParentCert == ([64]byte{}) {
 		return errors.New("signet: release_parent_cert is empty; the Guild has not authorized this release")
@@ -161,11 +161,11 @@ func (c *Config) ValidateForBuild() error {
 	return nil
 }
 
-// validateSignerScheme rejects file:// (never allowed) and unknown
+// validateDivinerScheme rejects file:// (never allowed) and unknown
 // schemes.  Recognized production schemes: gcpkms://, awskms://,
 // azurekv://.  New schemes are added here as the toolchain grows
-// signer implementations.
-func validateSignerScheme(url string) error {
+// diviner implementations.
+func validateDivinerScheme(url string) error {
 	i := strings.Index(url, "://")
 	if i < 0 {
 		return fmt.Errorf("missing scheme (expected e.g. gcpkms://...)")
@@ -175,9 +175,9 @@ func validateSignerScheme(url string) error {
 	case "gcpkms", "awskms", "azurekv":
 		return nil
 	case "file":
-		return errors.New("file:// signer scheme is forbidden — JanOS requires HSM-backed KMS signing at all times")
+		return errors.New("file:// diviner scheme is forbidden — JanOS requires HSM-backed KMS signing at all times")
 	default:
-		return fmt.Errorf("unknown signer scheme %q; supported: gcpkms, awskms, azurekv", scheme)
+		return fmt.Errorf("unknown diviner scheme %q; supported: gcpkms, awskms, azurekv", scheme)
 	}
 }
 
