@@ -28,8 +28,9 @@ We track tamago cadence, not go.googlesource.com cadence — tamago maintainers 
 
 - `origin` — `ssh://git@github.com/enigmaneering/janos.git`
 - `upstream` — `ssh://git@github.com/usbarmory/tamago-go.git`
-- Base branch — [`upstream/tamago1.26.4`](https://github.com/usbarmory/tamago-go/tree/tamago1.26.4), tamago's latest at the time of fork (Go 1.26.4).
-- We stay close to tamago's branch naming: one branch per Go version. When tamago publishes `tamago1.27.x`, we cut a JanOS branch that rebases our commits onto it.
+- Base branch — [`upstream/tamago1.26.4`](https://github.com/usbarmory/tamago-go/tree/tamago1.26.4), tamago's stable release branch for Go 1.26.4.
+- We track tamago's **release branches**, never `upstream/master`. Tamago publishes one release branch per Go patch version (`tamago1.25.7`, `tamago1.26.0`, `.1`, `.2`, `.3`, `.4`, …), curated by upstream maintainers, backports of security and correctness fixes only. `upstream/master` is where their experimental development happens and is off-limits for JanOS.
+- When tamago publishes `tamago1.27.0` (or a newer patch on the current line), we cut a JanOS branch that rebases our commits onto that release branch.
 - `golang-mirror` — snapshot of what `origin/master` pointed at before the JanOS reset (plain `golang/go` `master`). Kept as a safety branch; no active development on it.
 
 ### Sync workflow
