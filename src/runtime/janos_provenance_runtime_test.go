@@ -1,15 +1,24 @@
 // Copyright 2026 The Enigmaneering Authors.
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// This file lives in the runtime package so external tests can reach
-// the package-internal janosSetGProvenance helper.
+// Test-only helpers that live in the runtime package so external tests
+// can reach package-internal state (janosSetGProvenance and
+// rootAttestSet). Production callers use SetRootBinaryAttestation
+// and CurrentProvenance.
 
 package runtime
 
-// SetCurrentProvenance overwrites the current goroutine's provenance.
-// Exported here for the sole benefit of janos_provenance_test.go —
-// production code sets provenance via the boot self-attestation path
-// and can call janosSetGProvenance directly.
-func SetCurrentProvenance(p Provenance) {
+// SetCurrentProvenanceForTest overwrites the current goroutine's
+// provenance without touching the SetRootBinaryAttestation once-guard.
+// Tests use this to snapshot-restore around inheritance assertions.
+func SetCurrentProvenanceForTest(p Provenance) {
 	janosSetGProvenance(getg(), p)
+}
+
+// ResetRootAttestForTest clears the once-guard on SetRootBinaryAttestation
+// so tests can drive the attest → assert → reset cycle repeatedly.
+// It does not touch any g's provenance — pair with SetCurrentProvenanceForTest
+// to fully reset test state.
+func ResetRootAttestForTest() {
+	rootAttestSet.Store(0)
 }

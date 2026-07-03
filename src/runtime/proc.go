@@ -885,6 +885,7 @@ func schedinit() {
 
 	cpuinit(godebug) // must run before alginit
 	alginit()        // maps, hash, rand must not be used before this call
+	janosInitInstanceID() // JanOS: assign this process's runtime instance ID
 	mcommoninit(gp.m, -1)
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules
