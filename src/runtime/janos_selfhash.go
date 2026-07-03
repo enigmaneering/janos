@@ -9,45 +9,27 @@
 // what makes provenance implicit — every JanOS binary knows what it
 // is without user code lifting a finger.
 //
-// The reader is target-specific: janos_selfhash_linux.go opens
-// /proc/self/exe, janos_selfhash_darwin.go opens the exe path recorded
-// during sysargs, and janos_selfhash_stub.go is a no-op used on
-// platforms we have not implemented yet (Windows, WASM, tamago, BSDs).
-// On the stub-covered platforms provenance stays at
+// Per-target files define janosInitBinaryHash end-to-end:
+//   janos_selfhash_linux.go   — opens /proc/self/exe with runtime open/read/closefd
+//   janos_selfhash_darwin.go  — opens runtime.executablePath with runtime open/read/closefd
+//   janos_selfhash_windows.go — CreateFileW/ReadFile/CloseHandle via kernel32 stdcall
+//   janos_selfhash_stub.go    — no-op for platforms without a reader yet
+//     (BSDs, Solaris, Plan 9, wasm, tamago)
+//
+// On stub-covered platforms provenance stays at
 // {BinaryHash: 0, TrustLevel: TrustNone}; higher layers can layer
 // hardware/colonel attestation on top when available.
 
 package runtime
 
-import "unsafe"
-
-// janosInitBinaryHash reads the executable image from disk, computes
-// SHA-256, and records the result in the current g's provenance.  It
-// is called from schedinit right after janosInitInstanceID.  On
-// platforms without a working janosOpenSelfBinary, it silently leaves
-// provenance in the zero state.
-func janosInitBinaryHash() {
-	fd := janosOpenSelfBinary()
-	if fd < 0 {
-		return
-	}
-	var d janosSHA256
-	d.Reset()
-	var buf [4096]byte
-	for {
-		n := read(fd, unsafe.Pointer(&buf[0]), int32(len(buf)))
-		if n < 0 {
-			closefd(fd)
-			return
-		}
-		if n == 0 {
-			break
-		}
-		d.Write(buf[:n])
-	}
-	closefd(fd)
-
+// janosStoreBinaryHash finishes a per-platform self-hash run: given the
+// completed SHA-256 digest, it writes both the hash and TrustSelfAttested
+// onto the current g's provenance.  Each per-target file calls this
+// once after it has streamed the binary through its own janosSHA256.
+//
+//go:nosplit
+func janosStoreBinaryHash(digest [32]byte) {
 	gp := getg()
-	gp.provenance.binaryHash = d.Sum()
+	gp.provenance.binaryHash = digest
 	gp.provenance.trustLevel = TrustSelfAttested
 }

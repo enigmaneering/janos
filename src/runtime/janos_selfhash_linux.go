@@ -7,20 +7,38 @@
 // JanOS: binary self-attestation, Linux reader.
 //
 // Linux exposes the currently running executable via the
-// /proc/self/exe symlink; opening it yields a file descriptor over the
-// on-disk image, which is exactly what SHA-256'ing the "binary" means
-// in this context.  This works regardless of whether the process still
-// has read permission on its original argv[0] path.
+// /proc/self/exe symlink; opening it yields a file descriptor over
+// the on-disk image, which is exactly what SHA-256'ing the "binary"
+// means in this context.  Works regardless of whether the process
+// still has read permission on its original argv[0] path.
 
 package runtime
 
-// Null-terminated for direct handoff to the runtime's open() syscall.
+import "unsafe"
+
 var janosSelfExePathLinux = [...]byte{'/', 'p', 'r', 'o', 'c', '/', 's', 'e', 'l', 'f', '/', 'e', 'x', 'e', 0}
 
-// janosLinuxORDONLY mirrors the C O_RDONLY constant.  Linux uses
-// value 0 across all supported architectures.
-const janosLinuxORDONLY = 0
+const janosLinuxORDONLY = 0 // O_RDONLY on all Linux archs
 
-func janosOpenSelfBinary() int32 {
-	return open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
+func janosInitBinaryHash() {
+	fd := open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
+	if fd < 0 {
+		return
+	}
+	var d janosSHA256
+	d.Reset()
+	var buf [4096]byte
+	for {
+		n := read(fd, unsafe.Pointer(&buf[0]), int32(len(buf)))
+		if n < 0 {
+			closefd(fd)
+			return
+		}
+		if n == 0 {
+			break
+		}
+		d.Write(buf[:n])
+	}
+	closefd(fd)
+	janosStoreBinaryHash(d.Sum())
 }
