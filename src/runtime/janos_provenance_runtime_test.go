@@ -10,6 +10,8 @@
 
 package runtime
 
+import "internal/runtime/janos_hash"
+
 // SetCurrentProvenanceForTest overwrites the current goroutine's
 // provenance.  Snapshot the value before calling and restore it in a
 // deferred call to avoid polluting other tests.
@@ -17,21 +19,21 @@ func SetCurrentProvenanceForTest(p Provenance) {
 	janosSetGProvenance(getg(), p)
 }
 
-// JanosSHA256ForTest exposes the runtime-internal SHA-256 to external
+// JanosSHA256ForTest exposes the runtime-adjacent SHA-256 to external
 // tests so they can compare its output against a known-good vector
 // without needing to import crypto/sha256 (which sits above runtime).
 func JanosSHA256ForTest(p []byte) [32]byte {
-	var d janosSHA256
+	var d janos_hash.SHA256
 	d.Reset()
 	d.Write(p)
 	return d.Sum()
 }
 
-// JanosSHA512ForTest exposes the runtime-internal SHA-512 to external
+// JanosSHA512ForTest exposes the runtime-adjacent SHA-512 to external
 // tests.  Ed25519 verification depends on SHA-512 internally, so we
 // vet it here against NIST test vectors before wiring it up.
 func JanosSHA512ForTest(p []byte) [64]byte {
-	var d janosSHA512
+	var d janos_hash.SHA512
 	d.Reset()
 	d.Write(p)
 	return d.Sum()

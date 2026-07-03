@@ -2,21 +2,17 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// JanOS: minimal SHA-512 implementation for use inside the runtime.
-//
-// Ed25519 signature verification depends on SHA-512 internally, and
-// the runtime cannot reach crypto/sha512 (it sits far above).  This
-// is a self-contained pure-Go port, algorithm and constants per FIPS
-// 180-4.  Same shape and style as janos_sha256.go — rotations
-// written out inline to avoid a math/bits import.
+// SHA-512 for the janos_hash package.  See sha256.go for the general
+// design notes; SHA-512 is the same shape with 128-byte blocks, 80
+// rounds, 8x64-bit state.
 
-package runtime
+package janos_hash
 
-// janosSHA512Chunk is the SHA-512 block size in bytes.
-const janosSHA512Chunk = 128
+// SHA512Chunk is the SHA-512 block size in bytes.
+const SHA512Chunk = 128
 
 // SHA-512 round constants (FIPS 180-4, §4.2.3).
-var janosSHA512K = [80]uint64{
+var sha512K = [80]uint64{
 	0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
 	0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
 	0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
@@ -39,17 +35,16 @@ var janosSHA512K = [80]uint64{
 	0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
 }
 
-// janosSHA512 is a streaming SHA-512 digest.  No allocations; fits
-// on the stack.
-type janosSHA512 struct {
+// SHA512 is a streaming SHA-512 digest.  Zero allocations; stack-safe.
+type SHA512 struct {
 	h   [8]uint64
-	x   [janosSHA512Chunk]byte
+	x   [SHA512Chunk]byte
 	nx  int
 	len uint64
 }
 
 // Reset returns the digest to its initial state.
-func (d *janosSHA512) Reset() {
+func (d *SHA512) Reset() {
 	d.h[0] = 0x6a09e667f3bcc908
 	d.h[1] = 0xbb67ae8584caa73b
 	d.h[2] = 0x3c6ef372fe94f82b
@@ -63,19 +58,19 @@ func (d *janosSHA512) Reset() {
 }
 
 // Write absorbs p into the digest.
-func (d *janosSHA512) Write(p []byte) {
+func (d *SHA512) Write(p []byte) {
 	d.len += uint64(len(p))
 	if d.nx > 0 {
 		n := copy(d.x[d.nx:], p)
 		d.nx += n
-		if d.nx == janosSHA512Chunk {
-			janosSHA512Block(d, d.x[:])
+		if d.nx == SHA512Chunk {
+			sha512Block(d, d.x[:])
 			d.nx = 0
 		}
 		p = p[n:]
 	}
-	if n := len(p) &^ (janosSHA512Chunk - 1); n > 0 {
-		janosSHA512Block(d, p[:n])
+	if n := len(p) &^ (SHA512Chunk - 1); n > 0 {
+		sha512Block(d, p[:n])
 		p = p[n:]
 	}
 	if len(p) > 0 {
@@ -83,15 +78,11 @@ func (d *janosSHA512) Write(p []byte) {
 	}
 }
 
-// Sum returns the 64-byte digest.  It does not modify the receiver;
-// callers may keep writing after a snapshot.
-func (d *janosSHA512) Sum() [64]byte {
+// Sum returns the 64-byte digest.  Does not modify the receiver.
+func (d *SHA512) Sum() [64]byte {
 	dd := *d
 	length := dd.len
-	// Pad with 1 bit then zeros until length ≡ 112 mod 128, then a
-	// 128-bit big-endian bit length.  We only fill the low 64 bits
-	// because the runtime never hashes more than 2^64 bytes.
-	var tmp [janosSHA512Chunk + 16]byte
+	var tmp [SHA512Chunk + 16]byte
 	tmp[0] = 0x80
 	var t uint64
 	if length%128 < 112 {
@@ -99,9 +90,8 @@ func (d *janosSHA512) Sum() [64]byte {
 	} else {
 		t = 128 + 112 - length%128
 	}
-	length <<= 3 // to bits
+	length <<= 3
 	pad := tmp[:t+16]
-	// Upper 8 bytes of the 128-bit length are zero (short messages).
 	pad[t+8+0] = byte(length >> 56)
 	pad[t+8+1] = byte(length >> 48)
 	pad[t+8+2] = byte(length >> 40)
@@ -126,15 +116,12 @@ func (d *janosSHA512) Sum() [64]byte {
 	return digest
 }
 
-// janosSHA512Block runs the compression function over p, which must
-// be a multiple of janosSHA512Chunk bytes.
-func janosSHA512Block(d *janosSHA512, p []byte) {
+func sha512Block(d *SHA512, p []byte) {
 	var w [80]uint64
 	h0, h1, h2, h3 := d.h[0], d.h[1], d.h[2], d.h[3]
 	h4, h5, h6, h7 := d.h[4], d.h[5], d.h[6], d.h[7]
-	for len(p) >= janosSHA512Chunk {
+	for len(p) >= SHA512Chunk {
 		a, b, c, dd, e, f, g, h := h0, h1, h2, h3, h4, h5, h6, h7
-
 		for i := 0; i < 80; i++ {
 			if i < 16 {
 				j := i * 8
@@ -149,7 +136,7 @@ func janosSHA512Block(d *janosSHA512, p []byte) {
 			}
 			S1 := ((e >> 14) | (e << 50)) ^ ((e >> 18) | (e << 46)) ^ ((e >> 41) | (e << 23))
 			ch := (e & f) ^ (^e & g)
-			t1 := h + S1 + ch + janosSHA512K[i] + w[i]
+			t1 := h + S1 + ch + sha512K[i] + w[i]
 			S0 := ((a >> 28) | (a << 36)) ^ ((a >> 34) | (a << 30)) ^ ((a >> 39) | (a << 25))
 			maj := (a & b) ^ (a & c) ^ (b & c)
 			t2 := S0 + maj
@@ -163,7 +150,6 @@ func janosSHA512Block(d *janosSHA512, p []byte) {
 			b = a
 			a = t1 + t2
 		}
-
 		h0 += a
 		h1 += b
 		h2 += c
@@ -172,8 +158,7 @@ func janosSHA512Block(d *janosSHA512, p []byte) {
 		h5 += f
 		h6 += g
 		h7 += h
-
-		p = p[janosSHA512Chunk:]
+		p = p[SHA512Chunk:]
 	}
 	d.h[0], d.h[1], d.h[2], d.h[3] = h0, h1, h2, h3
 	d.h[4], d.h[5], d.h[6], d.h[7] = h4, h5, h6, h7

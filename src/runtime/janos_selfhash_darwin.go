@@ -15,7 +15,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/janos_hash"
+	"unsafe"
+)
 
 const janosDarwinORDONLY = 0    // O_RDONLY
 const janosDarwinPathMax = 1024 // Darwin PATH_MAX
@@ -35,7 +38,7 @@ func janosInitBinaryHash() {
 	if fd < 0 {
 		return
 	}
-	var d janosSHA256
+	var d janos_hash.SHA256
 	d.Reset()
 	var buf [4096]byte
 	for {

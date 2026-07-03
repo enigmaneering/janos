@@ -14,7 +14,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/janos_hash"
+	"unsafe"
+)
 
 var janosSelfExePathLinux = [...]byte{'/', 'p', 'r', 'o', 'c', '/', 's', 'e', 'l', 'f', '/', 'e', 'x', 'e', 0}
 
@@ -25,7 +28,7 @@ func janosInitBinaryHash() {
 	if fd < 0 {
 		return
 	}
-	var d janosSHA256
+	var d janos_hash.SHA256
 	d.Reset()
 	var buf [4096]byte
 	for {

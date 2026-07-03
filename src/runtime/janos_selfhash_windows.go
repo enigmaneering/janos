@@ -15,7 +15,10 @@
 
 package runtime
 
-import "unsafe"
+import (
+	"internal/runtime/janos_hash"
+	"unsafe"
+)
 
 //go:cgo_import_dynamic runtime._GetModuleFileNameW GetModuleFileNameW%3 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateFileW CreateFileW%7 "kernel32.dll"
@@ -58,7 +61,7 @@ func janosInitBinaryHash() {
 		return
 	}
 
-	var d janosSHA256
+	var d janos_hash.SHA256
 	d.Reset()
 	var buf [janosWinReadChunk]byte
 	for {
