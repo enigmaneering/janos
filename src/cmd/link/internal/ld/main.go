@@ -117,6 +117,12 @@ var (
 	benchmarkFlag     = flag.String("benchmark", "", "set to 'mem' or 'cpu' to enable phase benchmarking")
 	benchmarkFileFlag = flag.String("benchmarkprofile", "", "emit phase profiles to `base`_phase.{cpu,mem}prof")
 
+	// JanOS: KMS URL naming the diviner that will seal this build's
+	// JANOSCRT slot after linking.  Empty means the diviner pass
+	// is skipped (dev builds); presence triggers the pass.  See
+	// cmd/janos/signet for the URL scheme spec.
+	flagJanosDiviner = flag.String("janos-diviner", "", "KMS URL of the diviner that seals this build's JANOSCRT slot")
+
 	flagW ternaryFlag
 	FlagW = new(bool) // the -w flag, computed in main from flagW
 )
@@ -474,6 +480,18 @@ func Main(arch *sys.Arch, theArch Arch) {
 
 	bench.Start("Asmb2")
 	asmb2(ctxt)
+
+	// JanOS: post-link diviner pass — seals this binary's identity
+	// into its JANOSCRT slot by computing SHA-256 of the assembled
+	// image (with the slot zeroed) and asking the configured KMS-
+	// backed diviner to sign the digest.  Empty flag skips the pass
+	// (dev builds).  janosDivinerPass is a no-op stub in this
+	// commit; sub-tasks B and C will fill it in with real hashing
+	// and KMS invocation.
+	bench.Start("JanosDiviner")
+	if *flagJanosDiviner != "" {
+		janosDivinerPass(ctxt, *flagJanosDiviner)
+	}
 
 	bench.Start("Munmap")
 	ctxt.Out.Close() // Close handles Munmapping if necessary.

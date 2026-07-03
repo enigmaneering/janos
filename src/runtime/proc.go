@@ -886,9 +886,15 @@ func schedinit() {
 
 	cpuinit(godebug) // must run before alginit
 	alginit()        // maps, hash, rand must not be used before this call
+	mcommoninit(gp.m, -1)
+	// JanOS provenance init runs AFTER mcommoninit because
+	// mcommoninit -> mrandinit is what seeds this M's chacha8 state.
+	// Before mrandinit, rand() reads a zero-seeded generator and
+	// returns deterministic values — an InstanceID from before that
+	// point would be identical across every launch of the same binary.
 	janosInitInstanceID() // JanOS: assign this process's runtime instance ID
 	janosInitBinaryHash() // JanOS: self-hash the binary and populate BinaryHash + TrustLevel
-	mcommoninit(gp.m, -1)
+	janosVerifyCertSlot() // JanOS: verify the JANOSCRT chain in this binary (no-op on undivined builds)
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules
 	itabsinit()     // uses activeModules
