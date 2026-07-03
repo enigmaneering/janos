@@ -22,7 +22,7 @@ func TestSizeof(t *testing.T) {
 		_32bit uintptr // size on 32bit platforms
 		_64bit uintptr // size on 64bit platforms
 	}{
-		{runtime.G{}, 344 + xreg, 504 + xreg}, // g, but exported for testing (JanOS: +56 for gProvenance)
+		{runtime.G{}, 408 + xreg, 568 + xreg}, // g, but exported for testing (JanOS: +120 for gProvenance)
 		{runtime.Sudog{}, 64, 104},            // sudog, but exported for testing
 	}
 

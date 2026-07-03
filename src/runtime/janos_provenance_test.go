@@ -102,6 +102,7 @@ func TestTrustLevelString(t *testing.T) {
 	}{
 		{runtime.TrustNone, "none"},
 		{runtime.TrustSelfAttested, "self-attested"},
+		{runtime.TrustJanosReleased, "janos-released"},
 		{runtime.TrustHardwareAttested, "hardware-attested"},
 		{runtime.TrustColonelAttested, "colonel-attested"},
 		{runtime.TrustLevel(200), "unknown"},
@@ -110,6 +111,119 @@ func TestTrustLevelString(t *testing.T) {
 		if got := c.lvl.String(); got != c.want {
 			t.Errorf("TrustLevel(%d).String() = %q; want %q", c.lvl, got, c.want)
 		}
+	}
+}
+
+// TestCertificateAccessorsZero: before any cert is populated, the
+// accessors return the zero value and UserCert reports absent.
+func TestCertificateAccessorsZero(t *testing.T) {
+	runtime.SetJanosCertificatesForTest(runtime.Certificate{}, runtime.Certificate{}, nil)
+	if g := runtime.GuildCert(); g != (runtime.Certificate{}) {
+		t.Errorf("GuildCert non-zero after clear: %+v", g)
+	}
+	if r := runtime.ReleaseCert(); r != (runtime.Certificate{}) {
+		t.Errorf("ReleaseCert non-zero after clear: %+v", r)
+	}
+	if _, ok := runtime.UserCert(); ok {
+		t.Error("UserCert reports present after clear")
+	}
+}
+
+// TestSetJanosCertificatesForTest populates then reads back the
+// three certs.  Also verifies Provenance carries the compact SHA-256
+// IDs of Guild/Release signer keys and TrustLevel bumps to
+// TrustJanosReleased.
+func TestSetJanosCertificatesForTest(t *testing.T) {
+	savedGuild := runtime.GuildCert()
+	savedRelease := runtime.ReleaseCert()
+	savedUser, savedHasUser := runtime.UserCert()
+	savedProv := runtime.CurrentProvenance()
+	defer func() {
+		var userPtr *runtime.Certificate
+		if savedHasUser {
+			userPtr = &savedUser
+		}
+		runtime.SetJanosCertificatesForTest(savedGuild, savedRelease, userPtr)
+		runtime.SetCurrentProvenanceForTest(savedProv)
+	}()
+
+	guild := runtime.Certificate{
+		Level:        0,
+		SignerPubKey: [32]byte{0x01, 0x02, 0x03},
+	}
+	release := runtime.Certificate{
+		Level:        1,
+		SignerPubKey: [32]byte{0x11, 0x12, 0x13},
+	}
+	user := runtime.Certificate{
+		Level:        2,
+		SignerPubKey: [32]byte{0x21, 0x22, 0x23},
+	}
+	runtime.SetJanosCertificatesForTest(guild, release, &user)
+
+	if got := runtime.GuildCert(); got != guild {
+		t.Errorf("GuildCert readback mismatch\nwant %+v\ngot  %+v", guild, got)
+	}
+	if got := runtime.ReleaseCert(); got != release {
+		t.Errorf("ReleaseCert readback mismatch\nwant %+v\ngot  %+v", release, got)
+	}
+	gotUser, ok := runtime.UserCert()
+	if !ok {
+		t.Fatal("UserCert reports absent after setting")
+	}
+	if gotUser != user {
+		t.Errorf("UserCert readback mismatch\nwant %+v\ngot  %+v", user, gotUser)
+	}
+
+	p := runtime.CurrentProvenance()
+	if p.TrustLevel != runtime.TrustJanosReleased {
+		t.Errorf("TrustLevel: want TrustJanosReleased, got %s", p.TrustLevel)
+	}
+	// GuildCertID is SHA-256 of guild.SignerPubKey; can't reproduce
+	// that exactly without importing janos_hash here, but we CAN
+	// verify it's nonzero and distinct from ReleaseCertID.
+	if p.GuildCertID == (runtime.Provenance{}).GuildCertID {
+		t.Error("GuildCertID zero after cert set")
+	}
+	if p.ReleaseCertID == (runtime.Provenance{}).ReleaseCertID {
+		t.Error("ReleaseCertID zero after cert set")
+	}
+	if p.GuildCertID == p.ReleaseCertID {
+		t.Error("GuildCertID == ReleaseCertID (distinct signer keys should hash differently)")
+	}
+}
+
+// TestCertIDsInheritance: after setting certs on the parent, a
+// spawned goroutine inherits the same IDs and TrustLevel.
+func TestCertIDsInheritance(t *testing.T) {
+	saved := runtime.CurrentProvenance()
+	savedGuild, savedRelease := runtime.GuildCert(), runtime.ReleaseCert()
+	savedUser, savedHasUser := runtime.UserCert()
+	defer func() {
+		var userPtr *runtime.Certificate
+		if savedHasUser {
+			userPtr = &savedUser
+		}
+		runtime.SetJanosCertificatesForTest(savedGuild, savedRelease, userPtr)
+		runtime.SetCurrentProvenanceForTest(saved)
+	}()
+
+	guild := runtime.Certificate{SignerPubKey: [32]byte{0xaa}}
+	release := runtime.Certificate{SignerPubKey: [32]byte{0xbb}}
+	runtime.SetJanosCertificatesForTest(guild, release, nil)
+	parent := runtime.CurrentProvenance()
+
+	var wg sync.WaitGroup
+	var child runtime.Provenance
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		child = runtime.CurrentProvenance()
+	}()
+	wg.Wait()
+
+	if child != parent {
+		t.Fatalf("child did not inherit cert IDs / trust level:\nparent %+v\nchild  %+v", parent, child)
 	}
 }
 

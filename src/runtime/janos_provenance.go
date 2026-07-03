@@ -41,6 +41,14 @@ type gProvenance struct {
 	// Set by janosInitBinaryHash at schedinit on platforms with a
 	// working self-hash reader; zero on stub platforms.
 	binaryHash [32]byte
+	// guildCertID is SHA-256 of the Guild signer's public key.  Set
+	// when the JANOSCRT cert-slot verification passes at schedinit;
+	// zero otherwise.  The full Certificate is available via
+	// runtime.GuildCert(); this ID is the compact per-g form.
+	guildCertID [32]byte
+	// releaseCertID is SHA-256 of the Release signer's public key.
+	// See runtime.ReleaseCert() for the full Certificate.
+	releaseCertID [32]byte
 	// trustLevel records how the current identity was established.
 	trustLevel TrustLevel
 	// _ padding — keeps the struct 8-byte aligned regardless of GOARCH.
@@ -71,6 +79,8 @@ func janosInitInstanceID() {
 func janosSetGProvenance(gp *g, p Provenance) {
 	gp.provenance.instanceID = p.InstanceID
 	gp.provenance.binaryHash = p.BinaryHash
+	gp.provenance.guildCertID = p.GuildCertID
+	gp.provenance.releaseCertID = p.ReleaseCertID
 	gp.provenance.trustLevel = p.TrustLevel
 }
 
@@ -85,14 +95,25 @@ func janosSetGProvenance(gp *g, p Provenance) {
 // platforms with a native self-hash reader; where no reader is
 // implemented yet, it is the zero value and TrustLevel is TrustNone.
 //
+// GuildCertID is SHA-256 of the Enigmaneering Guild signer public key
+// baked into this JanOS binary.  Zero on binaries that have not been
+// through the linker signing pass yet.  The full Certificate is
+// available via runtime.GuildCert().
+//
+// ReleaseCertID is SHA-256 of the JanOS Release signer public key.
+// Zero on unsigned binaries.  See runtime.ReleaseCert() for the full
+// Certificate.
+//
 // TrustLevel records how strongly the identity has been established.
 //
 // The zero value describes an unattested goroutine (TrustLevel ==
 // TrustNone), which occurs on platforms without a self-hash reader.
 type Provenance struct {
-	InstanceID [16]byte
-	BinaryHash [32]byte
-	TrustLevel TrustLevel
+	InstanceID    [16]byte
+	BinaryHash    [32]byte
+	GuildCertID   [32]byte
+	ReleaseCertID [32]byte
+	TrustLevel    TrustLevel
 }
 
 // TrustLevel records how strongly the current provenance has been verified.
@@ -105,8 +126,17 @@ const (
 	// TrustSelfAttested: the binary hashed itself at boot and asserted
 	// its own identity.  The floor across every JanOS target — the only
 	// trust level available in the browser (wasm) — and vulnerable to
-	// a tampered runtime.
+	// a tampered runtime.  Development builds sit here until the
+	// linker's signing pass is exercised.
 	TrustSelfAttested
+	// TrustJanosReleased: the runtime has verified a JANOSCRT slot
+	// containing valid Guild + Release signatures over this binary.
+	// This is the trust level a Guild-blessed release build reports
+	// at every boot.  Higher-strength attestations (hardware, colonel)
+	// can layer on top; the JANOSCRT slot itself is enforced at
+	// schedinit — any signature failure aborts the process before
+	// user code runs.
+	TrustJanosReleased
 	// TrustHardwareAttested: a TPM/SE has independently confirmed the
 	// running binary's measurement matches an expected value.
 	TrustHardwareAttested
@@ -122,6 +152,8 @@ func (t TrustLevel) String() string {
 		return "none"
 	case TrustSelfAttested:
 		return "self-attested"
+	case TrustJanosReleased:
+		return "janos-released"
 	case TrustHardwareAttested:
 		return "hardware-attested"
 	case TrustColonelAttested:
@@ -143,8 +175,10 @@ func (t TrustLevel) String() string {
 func CurrentProvenance() Provenance {
 	gp := getg()
 	return Provenance{
-		InstanceID: gp.provenance.instanceID,
-		BinaryHash: gp.provenance.binaryHash,
-		TrustLevel: gp.provenance.trustLevel,
+		InstanceID:    gp.provenance.instanceID,
+		BinaryHash:    gp.provenance.binaryHash,
+		GuildCertID:   gp.provenance.guildCertID,
+		ReleaseCertID: gp.provenance.releaseCertID,
+		TrustLevel:    gp.provenance.trustLevel,
 	}
 }
