@@ -5405,6 +5405,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	newg.parentGoid = callergp.goid
 	newg.gopc = callerpc
 	newg.ancestors = saveAncestors(callergp)
+	newg.provenance = callergp.provenance // JanOS: inherit identity from creator
 	newg.startpc = fn.fn
 	newg.runningCleanups.Store(false)
 	if isSystemGoroutine(newg, false) {

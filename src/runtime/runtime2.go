@@ -595,6 +595,13 @@ type g struct {
 	// valgrindStackID is used to track what memory is used for stacks when a program is
 	// built with the "valgrind" build tag, otherwise it is unused.
 	valgrindStackID uintptr
+
+	// JanOS: identity of the code this goroutine is running.
+	// Copied from the creator g at newproc1 time; see
+	// src/runtime/janos_provenance.go for the type definition.
+	// Placed at the end of g so no field offset known to liblink,
+	// cgo, or debuggers is disturbed.
+	provenance gProvenance
 }
 
 // gTrackingPeriod is the number of transitions out of _Grunning between
