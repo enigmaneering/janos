@@ -1,4 +1,5 @@
 // Copyright 2014 The Go Authors. All rights reserved.
+// Copyright The Enigmaneering Guild. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -886,6 +887,7 @@ func schedinit() {
 	cpuinit(godebug) // must run before alginit
 	alginit()        // maps, hash, rand must not be used before this call
 	janosInitInstanceID() // JanOS: assign this process's runtime instance ID
+	janosInitBinaryHash() // JanOS: self-hash the binary and populate BinaryHash + TrustLevel
 	mcommoninit(gp.m, -1)
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules

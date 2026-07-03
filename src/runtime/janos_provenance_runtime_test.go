@@ -1,24 +1,28 @@
-// Copyright 2026 The Enigmaneering Authors.
-// SPDX-License-Identifier: BSD-3-Clause
-//
+// Copyright The Enigmaneering Guild. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // Test-only helpers that live in the runtime package so external tests
-// can reach package-internal state (janosSetGProvenance and
-// rootAttestSet). Production callers use SetRootBinaryAttestation
-// and CurrentProvenance.
+// can reach package-internal state.  Production code has no setter
+// for provenance — it is entirely runtime-driven — so this file
+// exists purely to let the test harness synthesize inheritance
+// scenarios that the natural schedinit flow would not exercise.
 
 package runtime
 
 // SetCurrentProvenanceForTest overwrites the current goroutine's
-// provenance without touching the SetRootBinaryAttestation once-guard.
-// Tests use this to snapshot-restore around inheritance assertions.
+// provenance.  Snapshot the value before calling and restore it in a
+// deferred call to avoid polluting other tests.
 func SetCurrentProvenanceForTest(p Provenance) {
 	janosSetGProvenance(getg(), p)
 }
 
-// ResetRootAttestForTest clears the once-guard on SetRootBinaryAttestation
-// so tests can drive the attest → assert → reset cycle repeatedly.
-// It does not touch any g's provenance — pair with SetCurrentProvenanceForTest
-// to fully reset test state.
-func ResetRootAttestForTest() {
-	rootAttestSet.Store(0)
+// JanosSHA256ForTest exposes the runtime-internal SHA-256 to external
+// tests so they can compare its output against a known-good vector
+// without needing to import crypto/sha256 (which sits above runtime).
+func JanosSHA256ForTest(p []byte) [32]byte {
+	var d janosSHA256
+	d.Reset()
+	d.Write(p)
+	return d.Sum()
 }

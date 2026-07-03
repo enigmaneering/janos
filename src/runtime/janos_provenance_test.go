@@ -1,5 +1,6 @@
-// Copyright 2026 The Enigmaneering Authors.
-// SPDX-License-Identifier: BSD-3-Clause
+// Copyright The Enigmaneering Guild. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
 package runtime_test
 
@@ -10,7 +11,7 @@ import (
 )
 
 // TestInstanceIDAssigned confirms schedinit populates the process's
-// instance ID with non-zero random bytes. Every real JanOS process
+// instance ID with non-zero random bytes.  Every real JanOS process
 // carries an instance ID from before user init runs.
 func TestInstanceIDAssigned(t *testing.T) {
 	p := runtime.CurrentProvenance()
@@ -19,30 +20,19 @@ func TestInstanceIDAssigned(t *testing.T) {
 	}
 }
 
-// TestRootBinaryAttestation exercises the boot-time setter path,
-// checks the once-guard, and verifies that InstanceID is preserved
-// across the attestation.
-func TestRootBinaryAttestation(t *testing.T) {
-	saved := runtime.CurrentProvenance()
-	defer runtime.SetCurrentProvenanceForTest(saved)
-	defer runtime.ResetRootAttestForTest()
-	runtime.ResetRootAttestForTest()
-
-	before := runtime.CurrentProvenance()
-	hash := sha256Fixture("bootstrap-binary")
-
-	runtime.SetRootBinaryAttestation(hash, runtime.TrustSelfAttested)
-
-	after := runtime.CurrentProvenance()
-	if after.BinaryHash != hash {
-		t.Errorf("BinaryHash: want %x, got %x", hash, after.BinaryHash)
+// TestBinaryHashAssigned confirms schedinit self-hashed the running
+// binary on platforms that have a native reader (linux, darwin).  On
+// stub-covered platforms it will still be zero and the test skips.
+func TestBinaryHashAssigned(t *testing.T) {
+	p := runtime.CurrentProvenance()
+	if p.BinaryHash == (runtime.Provenance{}).BinaryHash {
+		if p.TrustLevel != runtime.TrustNone {
+			t.Fatalf("BinaryHash is zero but TrustLevel is %s; expected TrustNone", p.TrustLevel)
+		}
+		t.Skip("no self-hash reader on this platform yet — BinaryHash is zero, TrustLevel is TrustNone (expected)")
 	}
-	if after.TrustLevel != runtime.TrustSelfAttested {
-		t.Errorf("TrustLevel: want %s, got %s", runtime.TrustSelfAttested, after.TrustLevel)
-	}
-	if after.InstanceID != before.InstanceID {
-		t.Errorf("InstanceID mutated by SetRootBinaryAttestation:\nbefore %x\nafter  %x",
-			before.InstanceID, after.InstanceID)
+	if p.TrustLevel < runtime.TrustSelfAttested {
+		t.Fatalf("BinaryHash is populated but TrustLevel is %s; expected at least TrustSelfAttested", p.TrustLevel)
 	}
 }
 
@@ -123,10 +113,46 @@ func TestTrustLevelString(t *testing.T) {
 	}
 }
 
+// TestJanosSHA256KnownAnswer verifies the runtime-internal SHA-256
+// against NIST test vectors.  If this ever fails, everything else is
+// suspect — the whole self-attestation story hinges on this hash
+// being correct.
+func TestJanosSHA256KnownAnswer(t *testing.T) {
+	cases := []struct {
+		in   string
+		want [32]byte
+	}{
+		{"", [32]byte{
+			0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+			0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+			0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+			0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+		}},
+		{"abc", [32]byte{
+			0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+			0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+			0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+			0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+		}},
+		{"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", [32]byte{
+			0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06, 0x38, 0xb8,
+			0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39,
+			0xa3, 0x3c, 0xe4, 0x59, 0x64, 0xff, 0x21, 0x67,
+			0xf6, 0xec, 0xed, 0xd4, 0x19, 0xdb, 0x06, 0xc1,
+		}},
+	}
+	for _, c := range cases {
+		got := runtime.JanosSHA256ForTest([]byte(c.in))
+		if got != c.want {
+			t.Errorf("JanosSHA256(%q):\nwant %x\ngot  %x", c.in, c.want, got)
+		}
+	}
+}
+
 // sha256Fixture returns a fixed byte pattern derived from name.
-// It is not an actual SHA-256 — provenance tests do not care about
-// the hash's cryptographic origin, only that distinct labels produce
-// distinct byte patterns.
+// It is not an actual SHA-256 — provenance-inheritance tests do not
+// care about the hash's cryptographic origin, only that distinct
+// labels produce distinct byte patterns.
 func sha256Fixture(name string) [32]byte {
 	var out [32]byte
 	for i := range out {

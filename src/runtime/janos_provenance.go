@@ -1,6 +1,7 @@
-// Copyright 2026 The Enigmaneering Authors.
-// SPDX-License-Identifier: BSD-3-Clause
-//
+// Copyright The Enigmaneering Guild. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // JanOS: goroutine provenance.
 //
 // The identity of a running JanOS instance is a two-tuple:
@@ -14,21 +15,19 @@
 // available across native, tamago, and browser targets alike.)
 //
 // InstanceID is a runtime-generated random identifier assigned once at
-// schedinit and inherited by every goroutine. Two processes running
+// schedinit and inherited by every goroutine.  Two processes running
 // the same binary have the same BinaryHash but different InstanceIDs;
 // this lets a neural-network-style topology of same-binary peers keep
 // each peer individually addressable even though they share code.
 //
+// Both fields are set implicitly by the runtime at schedinit — see
+// janos_selfhash.go for the binary hash reader and janosInitInstanceID
+// below for the instance ID generator.  User code interacts with
+// provenance only through the read-only CurrentProvenance accessor.
 // Every g carries a gProvenance value copied — never referenced —
-// from its creator at newproc1 time (see src/runtime/proc.go). Provenance
-// is set on g0 during schedinit; user code sets the BinaryHash later via
-// SetRootBinaryAttestation once it has computed the binary's digest with
-// a target-appropriate method (reading /proc/self/exe, os.Executable(),
-// fetching the running wasm module, or reading the tamago boot image).
+// from its creator at newproc1 time (see src/runtime/proc.go).
 
 package runtime
-
-import "internal/runtime/atomic"
 
 // gProvenance is the identity of the binary a goroutine is executing.
 // It is copied — never referenced — into child goroutines, so it is
@@ -39,7 +38,8 @@ type gProvenance struct {
 	// by every goroutine from that point forward.
 	instanceID [16]byte
 	// binaryHash is the SHA-256 self-attestation of the running binary.
-	// Zero until SetRootBinaryAttestation is called during boot.
+	// Set by janosInitBinaryHash at schedinit on platforms with a
+	// working self-hash reader; zero on stub platforms.
 	binaryHash [32]byte
 	// trustLevel records how the current identity was established.
 	trustLevel TrustLevel
@@ -47,16 +47,10 @@ type gProvenance struct {
 	_ [7]byte
 }
 
-// rootAttestSet guards SetRootBinaryAttestation against a second call.
-// Zero == not yet attested; nonzero == attested. See also
-// janosResetRootAttestForTest, which the runtime test harness uses to
-// reset this between test cases; production callers never touch it.
-var rootAttestSet atomic.Uint32
-
 // janosInitInstanceID populates the current g's instance ID with 16
-// random bytes. It is called from schedinit after randinit has finished
-// and rand() is safe to call. Every subsequent goroutine inherits the
-// value via newproc1's provenance copy.
+// random bytes.  It is called from schedinit after randinit has
+// finished and rand() is safe to call.  Every subsequent goroutine
+// inherits the value via newproc1's provenance copy.
 //
 //go:nosplit
 func janosInitInstanceID() {
@@ -70,10 +64,8 @@ func janosInitInstanceID() {
 }
 
 // janosSetGProvenance overwrites the provenance of the given g.
-// Package-internal — reserved for the runtime's own boot path and
-// future signed-boundary crossings in JanOS colonels. User code
-// interacts with provenance only via SetRootBinaryAttestation
-// (write, once) and CurrentProvenance (read).
+// Package-internal — reserved for future signed-boundary crossings in
+// JanOS colonels.  User code never sets provenance directly.
 //
 //go:nosplit
 func janosSetGProvenance(gp *g, p Provenance) {
@@ -84,19 +76,19 @@ func janosSetGProvenance(gp *g, p Provenance) {
 
 // Provenance is the identity of the code a goroutine is executing.
 //
-// InstanceID uniquely identifies this running JanOS instance. Two
+// InstanceID uniquely identifies this running JanOS instance.  Two
 // processes launched from the same binary have the same BinaryHash
 // but different InstanceIDs.
 //
 // BinaryHash is the SHA-256 self-attestation of the running binary.
-// It is zero until the JanOS boot code has computed the digest and
-// called SetRootBinaryAttestation.
+// It is populated automatically by the runtime at schedinit on
+// platforms with a native self-hash reader; where no reader is
+// implemented yet, it is the zero value and TrustLevel is TrustNone.
 //
 // TrustLevel records how strongly the identity has been established.
 //
 // The zero value describes an unattested goroutine (TrustLevel ==
-// TrustNone), which is the state a JanOS binary boots in until
-// self-attestation completes.
+// TrustNone), which occurs on platforms without a self-hash reader.
 type Provenance struct {
 	InstanceID [16]byte
 	BinaryHash [32]byte
@@ -111,7 +103,7 @@ const (
 	// TrustNone: identity has not been established (zero value).
 	TrustNone TrustLevel = iota
 	// TrustSelfAttested: the binary hashed itself at boot and asserted
-	// its own identity. The floor across every JanOS target — the only
+	// its own identity.  The floor across every JanOS target — the only
 	// trust level available in the browser (wasm) — and vulnerable to
 	// a tampered runtime.
 	TrustSelfAttested
@@ -143,7 +135,7 @@ func (t TrustLevel) String() string {
 // goroutine.
 //
 // It reads directly off the g descriptor — no allocation, no syscall,
-// no lock. Safe to call in hot paths. The returned value is a
+// no lock.  Safe to call in hot paths.  The returned value is a
 // snapshot; provenance is fixed for the lifetime of a goroutine, so
 // callers do not need to worry about the value changing under them.
 //
@@ -155,29 +147,4 @@ func CurrentProvenance() Provenance {
 		BinaryHash: gp.provenance.binaryHash,
 		TrustLevel: gp.provenance.trustLevel,
 	}
-}
-
-// SetRootBinaryAttestation records the SHA-256 self-attestation of the
-// running binary against the current goroutine's provenance. It must
-// be called exactly once per process, before any worker goroutines
-// have been spawned — typically from an init() function in the JanOS
-// bootstrap package that computes the hash with a target-appropriate
-// method.
-//
-// Level must be TrustSelfAttested or stronger. Passing TrustNone is a
-// programming error (there is nothing to attest).
-//
-// A second call throws. All goroutines created after this call
-// inherit the attested identity; the InstanceID assigned at schedinit
-// is preserved.
-func SetRootBinaryAttestation(hash [32]byte, level TrustLevel) {
-	if level == TrustNone {
-		throw("runtime.SetRootBinaryAttestation: level must be at least TrustSelfAttested")
-	}
-	if !rootAttestSet.CompareAndSwap(0, 1) {
-		throw("runtime.SetRootBinaryAttestation called more than once")
-	}
-	gp := getg()
-	gp.provenance.binaryHash = hash
-	gp.provenance.trustLevel = level
 }
