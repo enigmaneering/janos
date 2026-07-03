@@ -26,3 +26,13 @@ func JanosSHA256ForTest(p []byte) [32]byte {
 	d.Write(p)
 	return d.Sum()
 }
+
+// JanosSHA512ForTest exposes the runtime-internal SHA-512 to external
+// tests.  Ed25519 verification depends on SHA-512 internally, so we
+// vet it here against NIST test vectors before wiring it up.
+func JanosSHA512ForTest(p []byte) [64]byte {
+	var d janosSHA512
+	d.Reset()
+	d.Write(p)
+	return d.Sum()
+}
