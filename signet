@@ -1,0 +1,72 @@
+# JanOS signet — build-time signing configuration.
+#
+# This file is read by cmd/link when building a JanOS binary.  It
+# declares which KMS-backed keys the compiler will use to sign this
+# release's binaries.  No private key material appears in this file
+# — all references are KMS URLs.  Authentication happens through the
+# operator's KMS SDK at build time (for example, `gcloud auth
+# application-default login` for Google Cloud KMS).
+#
+# Format is line-oriented plaintext.  Blank lines and lines starting
+# with `#` are comments and ignored.  Each non-comment line is
+# `KEY = VALUE`, with values being either KMS URLs, hex-encoded
+# public keys, or scalars, per the field.
+#
+# Every JanOS binary requires BOTH a guild_signer and a release_signer
+# to be present.  cmd/link refuses to produce an unsigned binary; if
+# authentication with either KMS fails, the build fails.  There is no
+# --skip-signing flag and no `file://` scheme — production JanOS has
+# no path to a locally-held private key.
+#
+# When forking JanOS, a maintainer replaces the guild_pubkey and
+# guild_signer lines with THEIR family's Guild root, generates their
+# own release keypair in a KMS they control, and updates
+# release_signer + release_pubkey accordingly.  Their binaries then
+# form their family line: still traceable to the Enigmaneering Guild
+# root via a chain-of-trust future extension, but signed as belonging
+# to their fork.
+
+# --- Guild root ------------------------------------------------------
+
+# The Enigmaneering Guild's non-revocable root public key, hex-encoded
+# (32 bytes, Ed25519).  Baked into every runtime this build produces.
+# Runtime verifies incoming binaries' Guild signatures against this
+# exact value.  Rotating this key means cutting a new family line.
+guild_pubkey =
+
+# KMS URL for the Guild root signing key.  Only invoked during a
+# Guild-blessed release ceremony (once per release), NOT on every
+# build.  Regular builds sign only with release_signer and expect the
+# Guild signature to be provided out-of-band from a previous ceremony.
+# The format is scheme://KMS-specific-path:
+#   gcpkms://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY/cryptoKeyVersions/N
+#   awskms://arn:aws:kms:REGION:ACCOUNT:key/KEY-ID
+#   azurekv://VAULT.vault.azure.net/keys/NAME/VERSION
+guild_signer =
+
+# --- Release cert ----------------------------------------------------
+
+# This release's public key, hex-encoded (32 bytes, Ed25519).  Baked
+# into the runtime — every binary this build produces will be
+# expected to carry a matching signature from release_signer.
+release_pubkey =
+
+# KMS URL for THIS release's signing key.  cmd/link invokes this on
+# every build; the operator's KMS credentials must be authenticated
+# before invoking `go build`.
+release_signer =
+
+# Path (in the KMS) or embedded value of the Guild's signature over
+# release_pubkey — the chain-of-trust link between Guild and Release.
+# Computed once during release ceremony and stored here; cmd/link
+# embeds it into the JANOSCRT slot's Release entry as parent_cert.
+release_parent_cert =
+
+# --- Release-level revocation serial ---------------------------------
+
+# Monotonic serial for this release's signing key.  Appears in the
+# JANOSCRT slot's Release entry as revoke_epoch.  Increment when
+# rotating to a new signing key ceremony under the same family line;
+# older serials on the same key can then be revoked without
+# invalidating the current one.
+release_epoch = 0

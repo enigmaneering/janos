@@ -188,3 +188,73 @@ func TestCertSlotWrongBinaryHash(t *testing.T) {
 		t.Error("slot verified against wrong binary hash")
 	}
 }
+
+// TestCertSlotRevokedRelease: a Release key on the revocation list
+// causes VerifyChain to reject, even when all signatures are valid.
+func TestCertSlotRevokedRelease(t *testing.T) {
+	releaseSeed := [32]byte{0x72, 0xff}
+	guild := certEntry(t, LevelGuild, guildSeed, [32]byte{}, false)
+	release := certEntry(t, LevelRelease, releaseSeed, guildSeed, true)
+	slot := EncodeSlot([]Certificate{guild, release})
+
+	// Sanity: passes before revocation.
+	if _, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey); !ok {
+		t.Fatal("pre-revocation chain rejected")
+	}
+
+	// Add the Release signer to the revoke list.
+	prev := SetRevokedReleasesForTest([]RevocationEntry{
+		RevocationEntryForTest(release.SignerPubKey, WildcardEpochForTest),
+	})
+	defer SetRevokedReleasesForTest(prev)
+
+	if _, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey); ok {
+		t.Error("chain with revoked Release verified")
+	}
+}
+
+// TestCertSlotRevokedReleaseSpecificEpoch: revocation targeting a
+// specific epoch only affects entries with that epoch.
+func TestCertSlotRevokedReleaseSpecificEpoch(t *testing.T) {
+	releaseSeed := [32]byte{0x72, 0x02}
+	guild := certEntry(t, LevelGuild, guildSeed, [32]byte{}, false)
+	release := certEntry(t, LevelRelease, releaseSeed, guildSeed, true)
+	release.RevokeEpoch = 5
+	slot := EncodeSlot([]Certificate{guild, release})
+
+	// Revoke a DIFFERENT epoch (7) — should still pass.
+	prev := SetRevokedReleasesForTest([]RevocationEntry{
+		RevocationEntryForTest(release.SignerPubKey, 7),
+	})
+	if _, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey); !ok {
+		t.Error("chain with non-matching epoch revocation rejected")
+	}
+
+	// Revoke THIS epoch (5) — should fail.
+	SetRevokedReleasesForTest([]RevocationEntry{
+		RevocationEntryForTest(release.SignerPubKey, 5),
+	})
+	if _, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey); ok {
+		t.Error("chain with matching epoch revocation verified")
+	}
+	SetRevokedReleasesForTest(prev)
+}
+
+// TestCertSlotRevokedUser: user cert revocation is enforced.
+func TestCertSlotRevokedUser(t *testing.T) {
+	releaseSeed := [32]byte{0x72, 0x03}
+	userSeed := [32]byte{0x75, 0x03}
+	guild := certEntry(t, LevelGuild, guildSeed, [32]byte{}, false)
+	release := certEntry(t, LevelRelease, releaseSeed, guildSeed, true)
+	user := certEntry(t, LevelUser, userSeed, releaseSeed, true)
+	slot := EncodeSlot([]Certificate{guild, release, user})
+
+	prev := SetRevokedUsersForTest([]RevocationEntry{
+		RevocationEntryForTest(user.SignerPubKey, WildcardEpochForTest),
+	})
+	defer SetRevokedUsersForTest(prev)
+
+	if _, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey); ok {
+		t.Error("chain with revoked User verified")
+	}
+}

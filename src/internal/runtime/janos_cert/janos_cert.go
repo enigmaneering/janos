@@ -198,6 +198,9 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 	if !janos_ed25519.Verify(r.signerPK[:], binaryHash[:], r.signature[:]) {
 		return VerifyResult{}, false
 	}
+	if isRevoked(revokedReleases, certIDFromPubKey(r.signerPK), r.revokeEpoch) {
+		return VerifyResult{}, false
+	}
 	res.Release = Certificate{
 		Level:        r.level,
 		RevokeEpoch:  r.revokeEpoch,
@@ -217,6 +220,9 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 			return VerifyResult{}, false
 		}
 		if !janos_ed25519.Verify(u.signerPK[:], binaryHash[:], u.signature[:]) {
+			return VerifyResult{}, false
+		}
+		if isRevoked(revokedUsers, certIDFromPubKey(u.signerPK), u.revokeEpoch) {
 			return VerifyResult{}, false
 		}
 		res.User = Certificate{
