@@ -4,19 +4,23 @@
 
 //go:build janos_signtest
 
-package diviner
+package mockdiviner_test
 
 import (
-	"internal/runtime/janos_ed25519"
 	"testing"
+
+	"cmd/janos/diviner"
+	_ "cmd/janos/diviner/mockdiviner" // registers mockdiviner:// scheme
+
+	"internal/runtime/janos_ed25519"
 )
 
-// TestMockDivinerRoundTrip: build a mock, sign a fixed digest with it,
-// verify the signature against the mock's own reported public key.
-// Exercises the whole interface — Open, PublicKey, Sign — and confirms
-// the output actually verifies under the real Ed25519 verifier.
+// TestMockDivinerRoundTrip: build a mock, sign a fixed digest,
+// verify against the mock's reported public key.  Exercises the
+// whole interface — Open, PublicKey, Sign — and confirms the output
+// actually verifies under the real Ed25519 verifier.
 func TestMockDivinerRoundTrip(t *testing.T) {
-	d, err := Open("mockdiviner://67756c6c") // "gull" hex + implicit right-pad
+	d, err := diviner.Open("mockdiviner://67756c6c") // "gull" hex
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -41,22 +45,20 @@ func TestMockDivinerRoundTrip(t *testing.T) {
 		t.Fatal("mock diviner produced a signature the verifier rejects")
 	}
 
-	// Tamper with the digest: verification must fail.
 	digest[0] ^= 1
 	if janos_ed25519.Verify(pk[:], digest[:], sig[:]) {
 		t.Error("verifier accepted mismatched digest")
 	}
 }
 
-// TestMockDivinerDistinctSeeds: two different mockdiviner URLs must
-// yield DIFFERENT public keys.  Confirms seed derivation isn't
-// collapsing distinct labels.
+// TestMockDivinerDistinctSeeds: distinct URLs must yield distinct
+// public keys.  Confirms seed derivation doesn't collapse labels.
 func TestMockDivinerDistinctSeeds(t *testing.T) {
-	a, err := Open("mockdiviner://67756c6c") // "gull"
+	a, err := diviner.Open("mockdiviner://67756c6c") // "gull"
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := Open("mockdiviner://72656c65617365") // "release"
+	b, err := diviner.Open("mockdiviner://72656c65617365") // "release"
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +71,7 @@ func TestMockDivinerDistinctSeeds(t *testing.T) {
 
 // TestMockDivinerRejectsMalformedURL: bad hex is a hard error.
 func TestMockDivinerRejectsMalformedURL(t *testing.T) {
-	_, err := Open("mockdiviner://ZZZZ")
+	_, err := diviner.Open("mockdiviner://ZZZZ")
 	if err == nil {
 		t.Fatal("Open accepted malformed hex seed")
 	}
@@ -77,7 +79,7 @@ func TestMockDivinerRejectsMalformedURL(t *testing.T) {
 
 // TestMockDivinerRejectsEmptySeed: empty URL after prefix -> error.
 func TestMockDivinerRejectsEmptySeed(t *testing.T) {
-	_, err := Open("mockdiviner://")
+	_, err := diviner.Open("mockdiviner://")
 	if err == nil {
 		t.Fatal("Open accepted empty seed")
 	}

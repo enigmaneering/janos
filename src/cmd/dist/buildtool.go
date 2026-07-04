@@ -57,6 +57,14 @@ var bootstrapDirs = []string{
 	"cmd/internal/sys",
 	"cmd/internal/telemetry",
 	"cmd/internal/telemetry/counter",
+	// JanOS: cmd/link's diviner pass imports these to seal binaries
+	// with a JANOSCRT slot.  certslot is the shared byte-layout;
+	// signet parses the build-time KMS configuration; diviner is the
+	// URL-scheme registry + KMS backends.
+	"cmd/janos/certslot",
+	"cmd/janos/signet",
+	"cmd/janos/diviner",
+	"cmd/janos/diviner/gcpkms",
 	"cmd/link",
 	"cmd/link/internal/...",
 	"compress/flate",

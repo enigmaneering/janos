@@ -5,81 +5,74 @@
 // JanOS: certificate slot format and chain-of-trust verification.
 //
 // Every JanOS binary carries a fixed-size "JANOSCRT" slot embedded
-// by the linker.  The slot contains up to eight signature entries
-// arranged as a chain of trust:
+// by the linker's diviner pass.  The slot contains up to eight
+// signature entries arranged as a chain of trust:
 //
-//    entry[0] Guild        — non-revocable, signed by the Enigmaneering
-//                            Guild root key.  Runtime hardcodes the
-//                            expected Guild public key.  Failure to
-//                            match aborts the process at schedinit.
-//    entry[1] Release      — per-release, signed by a Release key whose
-//                            public key was in turn signed by the Guild
-//                            (parent_cert).  The Release key expected by
-//                            this runtime is hardcoded at build time.
-//                            Failure aborts the process.
+//    entry[0] Guild        — non-revocable, identifies the family
+//                            line.  Runtime hardcodes the expected
+//                            Guild public key.  Failure to match
+//                            aborts the process at schedinit.
+//    entry[1] Release      — per-release, signed by a Release
+//                            key whose public key was in turn signed
+//                            by the Guild (parent_cert).  The Release
+//                            key expected by this runtime is
+//                            hardcoded at build time.  Failure aborts.
 //    entry[2] User         — Glitter's "signet".  Runtime does not
-//                            enforce it, but surfaces it via provenance
-//                            so Glitter programs can consume it for
-//                            identification and disclosure-based
-//                            execution decisions.
+//                            enforce it, but surfaces it via
+//                            provenance so Glitter programs can
+//                            consume it for identification and
+//                            disclosure-based execution decisions.
 //    entry[3..7]           — reserved for future extension.
 //
-// This file defines the on-disk layout and a pure verify function.
-// The schedinit hookup (task #57) and the linker-emitted slot (task
-// #49) come in follow-up work.
+// The on-disk layout (constants, Certificate struct, slot encoder)
+// lives in cmd/janos/certslot so it can be shared bootstrap-safely
+// between the runtime and cmd/link's diviner pass.  This file holds
+// the crypto-aware verification, revocation, and the runtime-facing
+// re-exports.
 
 package janos_cert
 
 import (
+	"cmd/janos/certslot"
 	"internal/runtime/janos_ed25519"
 	"internal/runtime/janos_hash"
 )
 
-// -- Slot layout constants ---------------------------------------
+// -- Re-exports from cmd/janos/certslot --------------------------
 
+// Slot layout constants.
 const (
-	SlotSize    = 2048       // total slot bytes (zeroed for hash)
-	Magic       = "JANOSCRT" // first 8 bytes
-	MagicSize   = 8
-	Version     = 1
-	HeaderSize  = 16 // magic (8) + ver (1) + entry_count (1) + reserved (6)
-	EntrySize   = 168
-	MaxEntries  = 8
-	EntriesSize = EntrySize * MaxEntries // 1344
+	SlotSize    = certslot.SlotSize
+	Magic       = certslot.Magic
+	MagicSize   = certslot.MagicSize
+	Version     = certslot.Version
+	HeaderSize  = certslot.HeaderSize
+	EntrySize   = certslot.EntrySize
+	MaxEntries  = certslot.MaxEntries
+	EntriesSize = certslot.EntriesSize
 )
 
 // Entry level codes.
 const (
-	LevelGuild   = 0
-	LevelRelease = 1
-	LevelUser    = 2
-	LevelEmpty   = 0xFF
+	LevelGuild   = certslot.LevelGuild
+	LevelRelease = certslot.LevelRelease
+	LevelUser    = certslot.LevelUser
+	LevelEmpty   = certslot.LevelEmpty
 )
 
-// -- Public certificate type -------------------------------------
+// Certificate is a JANOSCRT slot entry.  Type alias so callers can
+// pass values between janos_cert and cmd/janos/certslot without
+// conversions.
+type Certificate = certslot.Certificate
 
-// Certificate is the runtime-visible form of one JANOSCRT slot entry.
-// GuildCert/ReleaseCert/UserCert accessors return values of this type.
-type Certificate struct {
-	// Level is one of TrustJanosGuild / TrustJanosRelease / TrustJanosUser
-	// (mirrors the on-disk level byte).
-	Level uint8
-	// RevokeEpoch is the signer's per-key revocation serial.  Compared
-	// against the runtime's baked-in revocation list.
-	RevokeEpoch uint32
-	// SignerPubKey is the Ed25519 public key that produced Signature.
-	SignerPubKey [32]byte
-	// ParentCert is the parent level's Ed25519 signature over
-	// SignerPubKey.  Zero for Guild (no parent).
-	ParentCert [64]byte
-	// Signature is the Ed25519 signature over the binary's SHA-256
-	// digest (computed with the cert slot region zeroed).
-	Signature [64]byte
+// EncodeSlot returns a slot with the given entries in order.
+func EncodeSlot(entries []Certificate) [SlotSize]byte {
+	return certslot.EncodeSlot(entries)
 }
 
 // -- Byte-level accessors ----------------------------------------
 
-// entry describes one slot entry's byte offsets.
+// entry describes one slot entry's byte offsets internally.
 //
 //	offset  size  field
 //	   0     1    level
@@ -97,8 +90,6 @@ type entry struct {
 }
 
 // decodeEntry unpacks entry bytes from the slot at the given index.
-// Returns (entry, true) on success or (zero, false) if idx is out of
-// range or the header magic/version is wrong.
 func decodeEntry(slot []byte, idx int) (entry, bool) {
 	if idx < 0 || idx >= MaxEntries {
 		return entry{}, false
@@ -132,28 +123,24 @@ func checkSlotHeader(slot []byte) bool {
 // -- Verification -------------------------------------------------
 
 // VerifyResult reports which entries were successfully verified.
-// Missing entries return the zero value.
 type VerifyResult struct {
-	Guild   Certificate // valid if HasGuild
-	Release Certificate // valid if HasRelease
-	User    Certificate // valid if HasUser
+	Guild   Certificate
+	Release Certificate
+	User    Certificate
 
 	HasGuild, HasRelease, HasUser bool
 }
 
-// VerifyChain walks the entries in slot and validates the
-// chain of trust: entry 0 must be Guild-signed with a public key that
-// exactly equals expectGuildPK, entry 1 (if present) must be Release-
-// signed and its public key must equal expectReleasePK AND its
-// parent_cert must be a valid Guild signature over that public key,
-// entry 2 (if present) is User-signed and its parent_cert must be a
-// valid Release signature over the user's public key.
-//
-// binaryHash is SHA-256 of the binary with the slot region zeroed.
-//
-// Returns (result, true) if the chain of trust is intact.  Any
-// failure — bad magic/version, wrong Guild PK, invalid sig, missing
-// Guild entry — returns (zero, false).
+// VerifyChain walks the entries in slot and validates the chain of
+// trust.  Guild entry mandatory: SignerPubKey must equal
+// expectGuildPK; the Guild does not sign individual binaries so its
+// Signature field is not checked.  Release entry mandatory:
+// SignerPubKey must equal expectReleasePK, ParentCert must verify as
+// Guild's signature over Release's SignerPubKey, and Signature must
+// verify as Release's signature over binaryHash.  Revocation is
+// consulted for Release and User (if present).  User entry
+// optional; when present, its ParentCert must be Release's signature
+// over the User's SignerPubKey.
 func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleasePK [32]byte) (VerifyResult, bool) {
 	var res VerifyResult
 
@@ -161,15 +148,12 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 		return VerifyResult{}, false
 	}
 
-	// Entry 0: Guild.  MANDATORY.
+	// Entry 0: Guild.  Identity-only — Guild does not sign binaries.
 	g, ok := decodeEntry(slot, 0)
 	if !ok || g.level != LevelGuild {
 		return VerifyResult{}, false
 	}
 	if g.signerPK != expectGuildPK {
-		return VerifyResult{}, false
-	}
-	if !janos_ed25519.Verify(g.signerPK[:], binaryHash[:], g.signature[:]) {
 		return VerifyResult{}, false
 	}
 	res.Guild = Certificate{
@@ -181,9 +165,8 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 	}
 	res.HasGuild = true
 
-	// Entry 1: Release.  MANDATORY for now; empty slot means "not a
-	// Guild-blessed release build" and verification fails.  (When
-	// dev builds without a release cert are wanted, we relax this.)
+	// Entry 1: Release.  Mandatory.  Guild-signed pubkey +
+	// binary-signing sig.
 	r, ok := decodeEntry(slot, 1)
 	if !ok || r.level != LevelRelease {
 		return VerifyResult{}, false
@@ -191,7 +174,6 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 	if r.signerPK != expectReleasePK {
 		return VerifyResult{}, false
 	}
-	// Guild signed the Release public key.
 	if !janos_ed25519.Verify(expectGuildPK[:], r.signerPK[:], r.parentCert[:]) {
 		return VerifyResult{}, false
 	}
@@ -210,13 +192,10 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 	}
 	res.HasRelease = true
 
-	// Entry 2: User.  OPTIONAL.  If present, must chain to Release.
+	// Entry 2: User.  Optional.  When present, must chain to Release.
 	u, ok := decodeEntry(slot, 2)
 	if ok && u.level == LevelUser {
-		// Release signed the user's public key.
 		if !janos_ed25519.Verify(r.signerPK[:], u.signerPK[:], u.parentCert[:]) {
-			// A malformed user cert is a hard failure — someone tried
-			// to attach an unauthorized user sig.
 			return VerifyResult{}, false
 		}
 		if !janos_ed25519.Verify(u.signerPK[:], binaryHash[:], u.signature[:]) {
@@ -234,7 +213,6 @@ func VerifyChain(slot []byte, binaryHash [32]byte, expectGuildPK, expectReleaseP
 		}
 		res.HasUser = true
 	}
-	// Empty user entry is fine; that binary just isn't Glitter-signed.
 
 	return res, true
 }

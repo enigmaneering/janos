@@ -123,6 +123,11 @@ var (
 	// cmd/janos/signet for the URL scheme spec.
 	flagJanosDiviner = flag.String("janos-diviner", "", "KMS URL of the diviner that seals this build's JANOSCRT slot")
 
+	// JanOS: path to the signet file this build reads for the Guild
+	// public key, Release public key, Guild-signed parent cert, and
+	// revocation epoch.  Mandatory when -janos-diviner is set.
+	flagJanosSignet = flag.String("janos-signet", "", "path to the JanOS signet file (mandatory with -janos-diviner)")
+
 	flagW ternaryFlag
 	FlagW = new(bool) // the -w flag, computed in main from flagW
 )

@@ -126,17 +126,40 @@ func TestCertSlotWrongReleaseKey(t *testing.T) {
 	}
 }
 
-// TestCertSlotTamperedSig: flipping a bit in Guild sig rejects.
-func TestCertSlotTamperedSig(t *testing.T) {
+// TestCertSlotTamperedReleaseSig: flipping a bit in Release's
+// binary-signing sig rejects.  Guild's Signature field is deliberately
+// unused (Guild does not sign individual binaries), so tampering with
+// it would NOT be caught by the verifier — the meaningful sigs are
+// Release.Signature (over the binary) and Release.ParentCert (Guild's
+// sig over Release.SignerPubKey).
+func TestCertSlotTamperedReleaseSig(t *testing.T) {
 	releaseSeed := [32]byte{0x72}
 	guild := certEntry(t, LevelGuild, guildSeed, [32]byte{}, false)
 	release := certEntry(t, LevelRelease, releaseSeed, guildSeed, true)
 	slot := EncodeSlot([]Certificate{guild, release})
-	// Guild sig starts at header (16) + 104 within its entry.
-	slot[16+104] ^= 1
+	// Release entry starts at HeaderSize + EntrySize = 16 + 168 = 184.
+	// Release sig starts at 184 + 104 = 288.
+	slot[HeaderSize+EntrySize+104] ^= 1
 	_, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey)
 	if ok {
-		t.Error("slot with tampered Guild signature verified")
+		t.Error("slot with tampered Release signature verified")
+	}
+}
+
+// TestCertSlotTamperedReleaseParentCert: flipping a bit in the Guild's
+// signature over Release's pubkey (Release.ParentCert) rejects.  This
+// is the chain link between Guild and Release, so tampering breaks
+// the whole chain.
+func TestCertSlotTamperedReleaseParentCert(t *testing.T) {
+	releaseSeed := [32]byte{0x72}
+	guild := certEntry(t, LevelGuild, guildSeed, [32]byte{}, false)
+	release := certEntry(t, LevelRelease, releaseSeed, guildSeed, true)
+	slot := EncodeSlot([]Certificate{guild, release})
+	// Release entry parent_cert starts at HeaderSize + EntrySize + 40 = 224.
+	slot[HeaderSize+EntrySize+40] ^= 1
+	_, ok := VerifyChain(slot[:], binHash, guild.SignerPubKey, release.SignerPubKey)
+	if ok {
+		t.Error("slot with tampered Release ParentCert verified")
 	}
 }
 

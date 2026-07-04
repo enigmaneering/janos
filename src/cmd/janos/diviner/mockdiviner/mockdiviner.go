@@ -4,29 +4,37 @@
 
 //go:build janos_signtest
 
-// A "mock" diviner backend, ONLY compiled with -tags janos_signtest.
-// Production JanOS builds never see this file: the scheme
-// `mockdiviner://` is not registered, so cmd/link's diviner pass would
-// reject a URL naming it.
+// Package mockdiviner registers a test-only diviner backend under
+// the mockdiviner:// scheme.  Only compiled with -tags janos_signtest.
 //
-// Purpose: give the diviner package's own tests (and any downstream
-// tests that need real Ed25519 signatures during unit testing) a
-// signer they can drive deterministically.  The mock wraps
-// internal/runtime/janos_ed25519's test-only SignForTest.
-
-package diviner
+// Purpose: give tests (and any downstream tests that need real
+// Ed25519 signatures during unit testing) a signer they can drive
+// deterministically.  The mock wraps internal/runtime/janos_ed25519's
+// test-only SignForTest.
+//
+// This package lives outside cmd/janos/diviner because cmd/janos/diviner
+// is bootstrap-copied, and bootstrap forbids imports of internal/*.
+// Living here keeps the mock's dependency on
+// internal/runtime/janos_ed25519 out of the bootstrap scan.
+//
+// Tests that want mockdiviner scheme available do:
+//
+//	import _ "cmd/janos/diviner/mockdiviner"
+package mockdiviner
 
 import (
 	"encoding/hex"
 	"fmt"
 	"internal/runtime/janos_ed25519"
 	"strings"
+
+	"cmd/janos/diviner"
 )
 
 // mockDiviner signs and verifies against a deterministic seed derived
 // from the URL path.  URL format: `mockdiviner://SEEDHEX` where
-// SEEDHEX is up to 64 hex characters (padded with zeros to 32 bytes
-// on the low-order side).
+// SEEDHEX is up to 64 hex characters (right-padded with zeros so
+// short labels like "guild" or "release" give distinct seeds).
 type mockDiviner struct {
 	seed [32]byte
 }
@@ -41,7 +49,7 @@ func (m *mockDiviner) Sign(digest [32]byte) ([64]byte, error) {
 	return sig, nil
 }
 
-func mockOpen(url string) (Diviner, error) {
+func open(url string) (diviner.Diviner, error) {
 	const prefix = "mockdiviner://"
 	if !strings.HasPrefix(url, prefix) {
 		return nil, fmt.Errorf("mockdiviner: URL %q does not start with %q", url, prefix)
@@ -53,8 +61,6 @@ func mockOpen(url string) (Diviner, error) {
 	if len(seedHex) > 64 {
 		return nil, fmt.Errorf("mockdiviner: seed hex too long (%d chars, max 64)", len(seedHex))
 	}
-	// Pad seedHex on the right so a caller can pass a short label
-	// like "guild" and get a stable, distinct 32-byte seed.
 	for len(seedHex) < 64 {
 		seedHex += "0"
 	}
@@ -68,5 +74,5 @@ func mockOpen(url string) (Diviner, error) {
 }
 
 func init() {
-	Register("mockdiviner", mockOpen)
+	diviner.Register("mockdiviner", open)
 }

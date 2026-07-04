@@ -25,15 +25,28 @@ package runtime
 const janosCertSlotStorageSize = 2048
 
 // janosCertSlotBytes is the 2 KiB block reserved for the JANOSCRT
-// certificate chain.  Patched by cmd/link's diviner pass; all-zero
-// on undivined builds (dev binaries produced before the diviner
-// pass is invoked, or by a stock Go toolchain with no diviner
-// configuration).
+// certificate chain.  Patched by cmd/link's diviner pass; on an
+// undivined build the block is all-zero after the magic bytes and
+// the version byte reads 0.
+//
+// Given an initializer so the array lands in .data (which is written
+// to the file), not .bss (which is not).  The diviner pass patches
+// bytes IN THE FILE, so a BSS location wouldn't work.  The initial
+// magic "JANOSCRT" makes the presence of the slot visible in a hex
+// dump even before the diviner runs; the version byte (offset 8) is
+// 0 on undivined builds and gets bumped to janos_cert.Version by the
+// diviner pass once the chain is populated.
 //
 // The variable's SYMBOL NAME (runtime.janosCertSlotBytes) is
 // significant — the diviner pass looks it up by name.  Do not rename
 // without updating cmd/link.
-var janosCertSlotBytes [janosCertSlotStorageSize]byte
+var janosCertSlotBytes = [janosCertSlotStorageSize]byte{
+	'J', 'A', 'N', 'O', 'S', 'C', 'R', 'T', // magic (offsets 0..7)
+	0x00, // version (offset 8) — 0 = undivined; diviner pass sets it
+	// entry_count (offset 9), reserved (10..15), and 8 entry slots
+	// (16..1359) all zero until the diviner runs.  Remaining reserved
+	// tail (1360..2047) is left permanently zero for future extension.
+}
 
 // janosCertSlot returns the runtime's own JANOSCRT slot bytes.
 // Empty (all-zero) on an undivined build; carries the chain of
@@ -61,28 +74,31 @@ func janosCertSlot() *[janosCertSlotStorageSize]byte {
 //go:noinline
 //go:nosplit
 func janosVerifyCertSlot() {
-	// Route the read through the atomic-load-style indirection below
-	// so the compiler cannot prove the value is zero.
-	m := janosSlotMagicByte()
-	if m == 0 {
-		// Undivined binary — nothing to check.
+	// The slot has "JANOSCRT" magic pre-baked (see initializer above),
+	// so the version byte is what tells us whether the diviner has
+	// populated the chain.  Indirected through janosSlotVersionByte
+	// so the compiler cannot prove at compile time what value the
+	// diviner will patch in.
+	v := janosSlotVersionByte()
+	if v == 0 {
+		// Undivined binary — no chain to verify.  Boot continues.
 		return
 	}
-	// TODO(diviner-C, task #57): compute SHA-256 of the running
-	// binary with the slot region zeroed, then linkname over to
+	// TODO(task #57): compute SHA-256 of the running binary with the
+	// slot region zeroed, then linkname over to
 	// internal/runtime/janos_cert.VerifyChain, then throw on any
 	// failure.
-	_ = m
+	_ = v
 }
 
-// janosSlotMagicByte returns the first byte of the JANOSCRT slot.
-// Indirected through this small function to defeat the compiler's
-// "the array is provably all-zero" const-fold — the diviner pass
-// patches the bytes AFTER the compiler is done, so runtime reads
-// must go to real memory.
+// janosSlotVersionByte returns the version byte of the JANOSCRT slot
+// (offset 8, right after the "JANOSCRT" magic).  Indirected through
+// this small no-inline function so the compiler cannot prove the
+// value at compile time — the diviner pass patches the bytes AFTER
+// the compiler is done, so runtime reads must go to real memory.
 //
 //go:noinline
 //go:nosplit
-func janosSlotMagicByte() byte {
-	return janosCertSlotBytes[0]
+func janosSlotVersionByte() byte {
+	return janosCertSlotBytes[8]
 }

@@ -174,6 +174,13 @@ func validateDivinerScheme(url string) error {
 	switch scheme {
 	case "gcpkms", "awskms", "azurekv":
 		return nil
+	case "mockdiviner":
+		// Accepted so tests can produce signets; the actual scheme
+		// is only usable when cmd/janos/diviner/mockdiviner has been
+		// imported (which requires -tags janos_signtest).  Production
+		// builds without that tag will fail at diviner.Open time when
+		// the registry has no entry for the scheme.
+		return nil
 	case "file":
 		return errors.New("file:// diviner scheme is forbidden — JanOS requires HSM-backed KMS signing at all times")
 	default:
