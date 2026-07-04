@@ -9,26 +9,24 @@
 // before ctxt.Out.Close munmaps it.  The pass:
 //
 //   1. Loads the signet file named by -janos-signet.
-//   2. Locates the runtime.janosCertSlotBytes symbol emitted by the
-//      Go runtime source.
-//   3. Zeros the slot region in a copy of the assembled image and
-//      computes SHA-256 of that copy.  (The verifier does the same
-//      thing at boot: reads its own file, zeros the slot region in
-//      an in-memory buffer, hashes, then verifies signatures against
-//      the resulting digest.)
+//   2. Locates the JANOSCRT slot in the assembled image by scanning
+//      for its pre-divined magic header.
+//   3. Zeros the slot region + the janosExpected*PubKey symbols in a
+//      copy of the assembled image, then computes SHA-256 excluding
+//      the Go build ID marker occurrences and the Mach-O code
+//      signature (via cmd/internal/buildid.FindAndHash).  Excluding
+//      those regions matters because cmd/go rewrites the build ID
+//      and recomputes the code signature after cmd/link finishes —
+//      any bytes the diviner signs there would drift out of sync
+//      with the final on-disk file.
 //   4. Invokes the configured diviner via URL-scheme dispatch
 //      (gcpkms://, awskms://, azurekv://, or mockdiviner:// in tests)
-//      to sign the digest.  Ed25519 signatures come back as raw
-//      64-byte values from every KMS backend.
+//      to sign the digest.  ECDSA P-256 signatures come back as raw
+//      64-byte r||s values from every KMS backend.
 //   5. Writes the Guild + Release chain into the slot region of the
-//      assembled image, in place — the mmap'd output buffer is our
-//      canvas.  The signet's release_parent_cert is embedded as the
-//      Release entry's parent_cert.  Guild's own signature over the
-//      binary is deliberately zero: Guild's private key is offline,
-//      and it endorses this release only through the parent_cert on
-//      the Release entry (which was produced once during a release
-//      ceremony, not on every build).  User (Glitter signet) is not
-//      populated here; it's appended later by janos-sign if at all.
+//      assembled image, in place.  Also patches the runtime's
+//      janosExpectedGuildPubKey / janosExpectedReleasePubKey vars to
+//      the signet's authoritative pubkeys.
 
 package ld
 
@@ -40,7 +38,9 @@ import (
 	// blank import here.
 	_ "cmd/janos/diviner/gcpkms"
 	"cmd/janos/signet"
+	"cmd/internal/buildid"
 
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 )
@@ -65,40 +65,59 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 		return
 	}
 
-	// Locate the JANOSCRT slot symbol in the assembled image.
-	ldr := ctxt.loader
-	slotSym := ldr.Lookup("runtime.janosCertSlotBytes", 0)
-	if slotSym == 0 {
-		Errorf("janos-diviner: symbol runtime.janosCertSlotBytes not found — is this a JanOS runtime?")
-		return
-	}
-	sect := ldr.SymSect(slotSym)
-	if sect == nil || sect.Seg == nil {
-		Errorf("janos-diviner: runtime.janosCertSlotBytes has no section — did the slot get placed in .bss? It must be initialized so it lands in .data")
-		return
-	}
-	slotVA := uint64(ldr.SymValue(slotSym))
-	if slotVA < sect.Vaddr || slotVA-sect.Vaddr >= sect.Length {
-		Errorf("janos-diviner: janosCertSlotBytes VA %#x is outside its section [%#x, %#x)", slotVA, sect.Vaddr, sect.Vaddr+sect.Length)
-		return
-	}
-	slotFileOff := sect.Seg.Fileoff + (slotVA - sect.Seg.Vaddr)
-	slotSize := int64(certslot.SlotSize)
-
-	// Compute SHA-256 of the whole binary with the slot region zeroed.
-	// We hash a copy so the slot bytes on disk still show the pre-populated
-	// magic; the verifier does the same in-memory-zeroing on boot.
+	// Find the JANOSCRT slot by scanning the assembled image for its
+	// pre-divined magic header ("JANOSCRT" + version 0 + entry_count 0
+	// + 6 reserved zero bytes).  Doing this by content search is more
+	// robust than trusting the loader's segment.Fileoff + (VA - Vaddr)
+	// math, which on darwin/arm64 was observed off by 32 bytes.
 	data := ctxt.Out.Data()
-	if int64(len(data)) < int64(slotFileOff)+slotSize {
-		Errorf("janos-diviner: output buffer is %d bytes but slot ends at %d", len(data), int64(slotFileOff)+slotSize)
+	slotOff, ok := janosLocateSlot(data)
+	if !ok {
+		Errorf("janos-diviner: JANOSCRT slot magic not found in assembled image — is runtime.janosCertSlotBytes properly initialized?")
 		return
 	}
+	slotSize := int64(certslot.SlotSize)
+	if int64(len(data)) < slotOff+slotSize {
+		Errorf("janos-diviner: output buffer is %d bytes but slot ends at %d", len(data), slotOff+slotSize)
+		return
+	}
+
+	// Prepare hashInput = copy of ctxt.Out.Data() with:
+	//   - the JANOSCRT slot region zeroed, and
+	//   - the janosExpected*PubKey regions zeroed.
+	// FindAndHash then further zeros the Go build ID occurrences and
+	// excludes the Mach-O code signature from the hash.  The runtime
+	// at boot applies matching zeroing to its on-disk read so both
+	// sides converge on the same digest.
 	hashInput := make([]byte, len(data))
 	copy(hashInput, data)
 	for i := int64(0); i < slotSize; i++ {
-		hashInput[int64(slotFileOff)+i] = 0
+		hashInput[slotOff+i] = 0
 	}
-	digest := sha256.Sum256(hashInput)
+	if err := janosZeroSymbol(ctxt, hashInput, "runtime.janosExpectedGuildPubKey", 64); err != nil {
+		Errorf("janos-diviner: %v", err)
+		return
+	}
+	if err := janosZeroSymbol(ctxt, hashInput, "runtime.janosExpectedReleasePubKey", 64); err != nil {
+		Errorf("janos-diviner: %v", err)
+		return
+	}
+
+	// FindAndHash zeros every occurrence of the Go build ID string
+	// while hashing, and excludes the Mach-O code signature blob.
+	// The linker knows the build ID via *flagBuildid; on ELF it's
+	// present in .note.go.buildid and *flagBuildid is authoritative.
+	// If -buildid was empty (very rare), fall back to plain SHA-256.
+	var digest [32]byte
+	if *flagBuildid == "" {
+		digest = sha256Of(hashInput)
+	} else {
+		_, digest, err = buildid.FindAndHash(bytes.NewReader(hashInput), *flagBuildid, 0)
+		if err != nil {
+			Errorf("janos-diviner: FindAndHash: %v", err)
+			return
+		}
+	}
 
 	// Open the release diviner and sign the digest.
 	d, err := diviner.Open(divinerURL)
@@ -112,9 +131,7 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 		return
 	}
 	// Cross-check the diviner's public key against the signet's
-	// declared release_pubkey — if they disagree, the operator's KMS
-	// URL and their signet are out of sync and the build should fail
-	// rather than silently emit a binary that won't verify anywhere.
+	// declared release_pubkey.
 	pubKey, err := d.PublicKey()
 	if err != nil {
 		Errorf("janos-diviner: PublicKey: %v", err)
@@ -142,16 +159,10 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 	}
 	slot := certslot.EncodeSlot([]certslot.Certificate{guildEntry, releaseEntry})
 
-	// Patch the slot into the assembled image, in place.  The
-	// verifier at boot re-computes the SHA-256 with the slot zeroed,
-	// so the actual bytes we write here do not affect what was
-	// signed.
-	copy(data[slotFileOff:slotFileOff+uint64(slotSize)], slot[:])
+	// Patch the slot into the assembled image, in place.
+	copy(data[slotOff:slotOff+slotSize], slot[:])
 
-	// Also patch the runtime's expected Guild + Release public key
-	// vars so schedinit's verifier knows what to check the slot
-	// against.  These symbols are declared with [64]byte initializers
-	// so they land in .data (file-backed) alongside the slot.
+	// Patch the runtime's expected Guild + Release public key vars.
 	if err := patchRuntimeKey(ctxt, "runtime.janosExpectedGuildPubKey", cfg.GuildPubKey[:]); err != nil {
 		Errorf("janos-diviner: %v", err)
 		return
@@ -162,9 +173,64 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 	}
 
 	if ctxt.Debugvlog != 0 {
-		ctxt.Logf("janos: diviner pass sealed %d-byte slot at file offset %#x (VA %#x, section %q); expected Guild/Release keys patched\n",
-			slotSize, slotFileOff, slotVA, sect.Name)
+		ctxt.Logf("janos: diviner pass sealed %d-byte slot at file offset %#x; expected Guild/Release keys patched\n",
+			slotSize, slotOff)
 	}
+}
+
+// janosLocateSlot scans buf for the JANOSCRT slot's pre-divined
+// header ("JANOSCRT" + version 0 + entry_count 0 + 6 reserved zero
+// bytes) and returns the byte offset of the 'J' plus true on
+// success.  The 16-byte pattern is unique to an initialised (but
+// not yet sealed) JANOSCRT slot.
+func janosLocateSlot(buf []byte) (int64, bool) {
+	for i := 0; i+16 <= len(buf); i++ {
+		if buf[i] != 'J' || buf[i+1] != 'A' || buf[i+2] != 'N' || buf[i+3] != 'O' ||
+			buf[i+4] != 'S' || buf[i+5] != 'C' || buf[i+6] != 'R' || buf[i+7] != 'T' {
+			continue
+		}
+		if buf[i+8] != 0 || buf[i+9] != 0 {
+			continue
+		}
+		if buf[i+10] != 0 || buf[i+11] != 0 || buf[i+12] != 0 ||
+			buf[i+13] != 0 || buf[i+14] != 0 || buf[i+15] != 0 {
+			continue
+		}
+		return int64(i), true
+	}
+	return 0, false
+}
+
+// janosZeroSymbol looks up symName in the loader and zeros exactly
+// n bytes at its computed file offset in buf.  Returns an error if
+// the symbol is missing, unsectioned, or out of range.  Called on
+// the hashInput copy so the runtime's expected pubkeys stay at
+// their sentinel values in the buffer the diviner signs.
+func janosZeroSymbol(ctxt *Link, buf []byte, symName string, n int) error {
+	ldr := ctxt.loader
+	s := ldr.Lookup(symName, 0)
+	if s == 0 {
+		return fmt.Errorf("symbol %s not found", symName)
+	}
+	sect := ldr.SymSect(s)
+	if sect == nil || sect.Seg == nil {
+		return fmt.Errorf("symbol %s has no section", symName)
+	}
+	symVA := uint64(ldr.SymValue(s))
+	fileOff := sect.Seg.Fileoff + (symVA - sect.Seg.Vaddr)
+	if int(fileOff)+n > len(buf) {
+		return fmt.Errorf("symbol %s offset %#x+%d is past end of buffer", symName, fileOff, n)
+	}
+	for i := 0; i < n; i++ {
+		buf[int(fileOff)+i] = 0
+	}
+	return nil
+}
+
+// sha256Of returns SHA-256 of buf.  Wraps crypto/sha256 for the
+// no-build-ID fallback path.
+func sha256Of(buf []byte) [32]byte {
+	return sha256.Sum256(buf)
 }
 
 // janosInheritParentKeysIntoOutput is declared in a per-build-tag

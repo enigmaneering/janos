@@ -8,50 +8,38 @@
 //
 // On Darwin the executable path is provided by the kernel in the argv
 // area of the launch parameters and captured by the runtime in
-// os_darwin.go's sysargs into the package-level executablePath.  By
-// the time schedinit runs the string is available; we copy it into a
-// null-terminated stack buffer and hand it to the runtime's own
-// open() syscall wrapper.
+// os_darwin.go's sysargs into the package-level executablePath.  We
+// hand the path to the two-pass streaming self-hasher in
+// janos_selfhash.go; that hasher does all the exclusion / mask work.
 
 package runtime
 
-import (
-	"internal/runtime/janos_hash"
-	"unsafe"
-)
+const janosDarwinORDONLY = 0
+const janosDarwinPathMax = 1024
 
-const janosDarwinORDONLY = 0    // O_RDONLY
-const janosDarwinPathMax = 1024 // Darwin PATH_MAX
+// janosDarwinExePath holds a null-terminated copy of executablePath
+// so the opener can reopen the file across passes without touching
+// the (possibly growing) Go string.  Populated on the first opener
+// call.
+var janosDarwinExePath [janosDarwinPathMax + 1]byte
 
 func janosInitBinaryHash() {
 	p := executablePath
 	if len(p) == 0 || len(p) >= janosDarwinPathMax {
 		return
 	}
-	var pathBuf [janosDarwinPathMax + 1]byte
 	for i := 0; i < len(p); i++ {
-		pathBuf[i] = p[i]
+		janosDarwinExePath[i] = p[i]
 	}
-	pathBuf[len(p)] = 0
+	janosDarwinExePath[len(p)] = 0
 
-	fd := open(&pathBuf[0], janosDarwinORDONLY, 0)
-	if fd < 0 {
+	digest, ok := janosHashExecutable(janosDarwinOpenExe)
+	if !ok {
 		return
 	}
-	var d janos_hash.SHA256
-	d.Reset()
-	var buf [4096]byte
-	for {
-		n := read(fd, unsafe.Pointer(&buf[0]), int32(len(buf)))
-		if n < 0 {
-			closefd(fd)
-			return
-		}
-		if n == 0 {
-			break
-		}
-		d.Write(buf[:n])
-	}
-	closefd(fd)
-	janosStoreBinaryHash(d.Sum())
+	janosStoreBinaryHash(digest)
+}
+
+func janosDarwinOpenExe() int32 {
+	return open(&janosDarwinExePath[0], janosDarwinORDONLY, 0)
 }

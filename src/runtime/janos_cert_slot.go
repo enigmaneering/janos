@@ -46,18 +46,52 @@ var janosCertSlotBytes = [janosCertSlotStorageSize]byte{
 // janosExpectedGuildPubKey holds the ECDSA P-256 public key of the
 // Guild this runtime was built to recognise (X || Y, 64 bytes).
 // Patched by cmd/link's diviner pass from the signet's guild_pubkey
-// field.  All-zero on an undivined build; a divined binary with a
-// zero key here is a build-system bug and janosVerifyCertSlot throws.
+// field.  On an undivined build it retains the sentinel pattern
+// below and janosVerifyCertSlot takes the bootstrap-permissive path.
 //
-// Symbol name (runtime.janosExpectedGuildPubKey) is significant — the
-// diviner pass looks it up.
-var janosExpectedGuildPubKey = [64]byte{}
+// Non-zero initializer is load-bearing: without it the symbol would
+// land in __noptrbss (BSS), which is not file-backed, so the
+// diviner's patchRuntimeKey would write into memory that never
+// reaches the on-disk binary.
+//
+// Symbol name (runtime.janosExpectedGuildPubKey) is significant —
+// the diviner pass looks it up by name.
+var janosExpectedGuildPubKey = [64]byte{
+	'U', 'N', 'D', 'I', 'V', 'I', 'N', 'E', 'D', '-', 'G', 'U', 'I', 'L', 'D', '-',
+	'P', 'L', 'A', 'C', 'E', 'H', 'O', 'L', 'D', 'E', 'R', '-', 'X', 'Y', '-', 'D',
+	'O', 'E', 'S', '-', 'N', 'O', 'T', '-', 'V', 'E', 'R', 'I', 'F', 'Y', '-', 'A',
+	'S', '-', 'A', '-', 'P', '2', '5', '6', '-', 'P', 'U', 'B', 'K', 'E', 'Y', '.',
+}
 
-// janosExpectedReleasePubKey holds the ECDSA P-256 public key of the
-// Release this runtime was built to recognise (X || Y, 64 bytes).
-// Patched by cmd/link's diviner pass from the signet's release_pubkey
-// field.
-var janosExpectedReleasePubKey = [64]byte{}
+// janosExpectedReleasePubKey holds the ECDSA P-256 public key of
+// the Release this runtime was built to recognise (X || Y, 64
+// bytes).  Patched by cmd/link's diviner pass from the signet's
+// release_pubkey field.  Same sentinel discipline as
+// janosExpectedGuildPubKey above.
+var janosExpectedReleasePubKey = [64]byte{
+	'U', 'N', 'D', 'I', 'V', 'I', 'N', 'E', 'D', '-', 'R', 'E', 'L', 'E', 'A', 'S',
+	'E', '-', 'P', 'L', 'A', 'C', 'E', 'H', 'O', 'L', 'D', 'E', 'R', '-', 'X', 'Y',
+	'-', 'D', 'O', 'E', 'S', '-', 'N', 'O', 'T', '-', 'V', 'E', 'R', 'I', 'F', 'Y',
+	'-', 'A', 'S', '-', 'A', '-', 'P', '2', '5', '6', '-', 'P', 'U', 'B', 'K', 'Y',
+}
+
+// janosExpected*UndivinedSentinel expose the exact byte pattern the
+// vars above hold on an undivined build, so janosVerifyCertSlot can
+// distinguish bootstrap mode from strict mode.  Kept in sync with
+// the initializers by hand — they must match byte-for-byte.
+var janosExpectedGuildUndivinedSentinel = [64]byte{
+	'U', 'N', 'D', 'I', 'V', 'I', 'N', 'E', 'D', '-', 'G', 'U', 'I', 'L', 'D', '-',
+	'P', 'L', 'A', 'C', 'E', 'H', 'O', 'L', 'D', 'E', 'R', '-', 'X', 'Y', '-', 'D',
+	'O', 'E', 'S', '-', 'N', 'O', 'T', '-', 'V', 'E', 'R', 'I', 'F', 'Y', '-', 'A',
+	'S', '-', 'A', '-', 'P', '2', '5', '6', '-', 'P', 'U', 'B', 'K', 'E', 'Y', '.',
+}
+
+var janosExpectedReleaseUndivinedSentinel = [64]byte{
+	'U', 'N', 'D', 'I', 'V', 'I', 'N', 'E', 'D', '-', 'R', 'E', 'L', 'E', 'A', 'S',
+	'E', '-', 'P', 'L', 'A', 'C', 'E', 'H', 'O', 'L', 'D', 'E', 'R', '-', 'X', 'Y',
+	'-', 'D', 'O', 'E', 'S', '-', 'N', 'O', 'T', '-', 'V', 'E', 'R', 'I', 'F', 'Y',
+	'-', 'A', 'S', '-', 'A', '-', 'P', '2', '5', '6', '-', 'P', 'U', 'B', 'K', 'Y',
+}
 
 // janosCertSlot returns the runtime's own JANOSCRT slot bytes.
 func janosCertSlot() *[janosCertSlotStorageSize]byte {
@@ -66,16 +100,22 @@ func janosCertSlot() *[janosCertSlotStorageSize]byte {
 
 // JanosParentKeys returns the ECDSA P-256 public keys of the Guild
 // and Release the currently running JanOS runtime was built to
-// recognise.  Both zero on an undivined (bootstrap) runtime.
+// recognise.  Both zero on an undivined (bootstrap) runtime — the
+// bootstrap-sentinel placeholders are translated to zero here so
+// callers get a clean "no family line declared" signal.
 //
 // Used by cmd/link's post-link auto-inherit step to bake the current
-// janos binary's family-line keys into every colonel it produces —
-// so a colonel of a divined janos automatically enforces the same
-// family line even if the operator didn't pass -janos-diviner.
+// janos binary's family-line keys into every colonel it produces.
 // User code has no legitimate reason to call this; it is exposed
 // only for the toolchain.
 func JanosParentKeys() (guild, release [64]byte) {
-	return janosExpectedGuildPubKey, janosExpectedReleasePubKey
+	if janosExpectedGuildPubKey != janosExpectedGuildUndivinedSentinel {
+		guild = janosExpectedGuildPubKey
+	}
+	if janosExpectedReleasePubKey != janosExpectedReleaseUndivinedSentinel {
+		release = janosExpectedReleasePubKey
+	}
+	return
 }
 
 // janosSlotVersionByte returns the version byte of the JANOSCRT slot
@@ -118,15 +158,16 @@ func janosSlotVersionByte() byte {
 // Called from schedinit after the runtime is initialized enough for
 // stack growth.
 func janosVerifyCertSlot() {
-	zero := [64]byte{}
-	if janosExpectedGuildPubKey == zero && janosExpectedReleasePubKey == zero {
+	guildSentinel := janosExpectedGuildPubKey == janosExpectedGuildUndivinedSentinel
+	releaseSentinel := janosExpectedReleasePubKey == janosExpectedReleaseUndivinedSentinel
+	if guildSentinel && releaseSentinel {
 		// Bootstrap mode: no family line declared, nothing to enforce.
 		return
 	}
 
-	// Strict mode below.  Both expected keys must be non-zero (a
+	// Strict mode below.  Both expected keys must be baked in (a
 	// partial declaration is a build-system bug).
-	if janosExpectedGuildPubKey == zero || janosExpectedReleasePubKey == zero {
+	if guildSentinel || releaseSentinel {
 		throw("janos: only one of Guild/Release expected keys is baked in — build-system bug")
 	}
 

@@ -8,40 +8,23 @@
 //
 // Linux exposes the currently running executable via the
 // /proc/self/exe symlink; opening it yields a file descriptor over
-// the on-disk image, which is exactly what SHA-256'ing the "binary"
-// means in this context.  Works regardless of whether the process
-// still has read permission on its original argv[0] path.
+// the on-disk image.  We hand a null-terminated path buffer to the
+// two-pass streaming hasher in janos_selfhash.go.
 
 package runtime
 
-import (
-	"internal/runtime/janos_hash"
-	"unsafe"
-)
-
 var janosSelfExePathLinux = [...]byte{'/', 'p', 'r', 'o', 'c', '/', 's', 'e', 'l', 'f', '/', 'e', 'x', 'e', 0}
 
-const janosLinuxORDONLY = 0 // O_RDONLY on all Linux archs
+const janosLinuxORDONLY = 0
 
 func janosInitBinaryHash() {
-	fd := open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
-	if fd < 0 {
+	digest, ok := janosHashExecutable(janosLinuxOpenExe)
+	if !ok {
 		return
 	}
-	var d janos_hash.SHA256
-	d.Reset()
-	var buf [4096]byte
-	for {
-		n := read(fd, unsafe.Pointer(&buf[0]), int32(len(buf)))
-		if n < 0 {
-			closefd(fd)
-			return
-		}
-		if n == 0 {
-			break
-		}
-		d.Write(buf[:n])
-	}
-	closefd(fd)
-	janosStoreBinaryHash(d.Sum())
+	janosStoreBinaryHash(digest)
+}
+
+func janosLinuxOpenExe() int32 {
+	return open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
 }
