@@ -42,6 +42,7 @@ import (
 	"cmd/janos/signet"
 
 	"crypto/sha256"
+	"fmt"
 )
 
 // janosDivinerPass runs after asmb2 has finished writing the binary
@@ -147,8 +148,44 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 	// signed.
 	copy(data[slotFileOff:slotFileOff+uint64(slotSize)], slot[:])
 
+	// Also patch the runtime's expected Guild + Release public key
+	// vars so schedinit's verifier knows what to check the slot
+	// against.  These symbols are declared with [32]byte initializers
+	// so they land in .data (file-backed) alongside the slot.
+	if err := patchRuntimeKey(ctxt, "runtime.janosExpectedGuildPubKey", cfg.GuildPubKey[:]); err != nil {
+		Errorf("janos-diviner: %v", err)
+		return
+	}
+	if err := patchRuntimeKey(ctxt, "runtime.janosExpectedReleasePubKey", cfg.ReleasePubKey[:]); err != nil {
+		Errorf("janos-diviner: %v", err)
+		return
+	}
+
 	if ctxt.Debugvlog != 0 {
-		ctxt.Logf("janos: diviner pass sealed %d-byte slot at file offset %#x (VA %#x, section %q)\n",
+		ctxt.Logf("janos: diviner pass sealed %d-byte slot at file offset %#x (VA %#x, section %q); expected Guild/Release keys patched\n",
 			slotSize, slotFileOff, slotVA, sect.Name)
 	}
+}
+
+// patchRuntimeKey overwrites the bytes at the named runtime symbol
+// with value.  The symbol must be an initialized array of the same
+// length as value (32 bytes for a pubkey).
+func patchRuntimeKey(ctxt *Link, symName string, value []byte) error {
+	ldr := ctxt.loader
+	s := ldr.Lookup(symName, 0)
+	if s == 0 {
+		return fmt.Errorf("symbol %s not found in runtime", symName)
+	}
+	sect := ldr.SymSect(s)
+	if sect == nil || sect.Seg == nil {
+		return fmt.Errorf("symbol %s has no section (must be initialized)", symName)
+	}
+	symVA := uint64(ldr.SymValue(s))
+	fileOff := sect.Seg.Fileoff + (symVA - sect.Seg.Vaddr)
+	data := ctxt.Out.Data()
+	if int(fileOff)+len(value) > len(data) {
+		return fmt.Errorf("symbol %s offset %#x+%d is past end of output (%d)", symName, fileOff, len(value), len(data))
+	}
+	copy(data[fileOff:fileOff+uint64(len(value))], value)
+	return nil
 }

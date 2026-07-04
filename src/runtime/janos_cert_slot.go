@@ -2,40 +2,30 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// JanOS: JANOSCRT slot storage.
+// JanOS: JANOSCRT slot storage + schedinit verification hook.
 //
-// This file declares the fixed-size byte array that cmd/link's
-// diviner pass patches with the Guild + Release + optional User
-// certificate chain during the final build step.  At source time the
-// slot is all-zero; after the diviner pass runs the first 8 bytes
-// spell "JANOSCRT" and the remainder contains the encoded chain.
-//
-// The runtime discovers the slot at schedinit by reading
-// janosCertSlotBytes directly (same package, no linkname needed).
-// The diviner in cmd/link reaches it via its symbol name
-// runtime.janosCertSlotBytes.
+// This file declares the fixed-size byte array cmd/link's diviner
+// pass patches with the Guild + Release + optional User certificate
+// chain during the final build step, plus the runtime-side gate that
+// verifies the chain at schedinit and throws on any failure.
 
 package runtime
 
 // janosCertSlotStorageSize is the size of the JANOSCRT slot in bytes.
-// Matches internal/runtime/janos_cert.SlotSize.  Duplicated here as a
-// constant because the runtime cannot import janos_cert (that would
-// create the same cycle that put janos_cert outside the runtime tree
-// in the first place); if these ever diverge, tests will scream.
+// Matches cmd/janos/certslot.SlotSize.
 const janosCertSlotStorageSize = 2048
 
 // janosCertSlotBytes is the 2 KiB block reserved for the JANOSCRT
 // certificate chain.  Patched by cmd/link's diviner pass; on an
-// undivined build the block is all-zero after the magic bytes and
-// the version byte reads 0.
+// undivined build the block contains "JANOSCRT" magic followed by
+// version 0 (see initializer below) and the version-byte gate in
+// janosVerifyCertSlot skips verification.
 //
 // Given an initializer so the array lands in .data (which is written
 // to the file), not .bss (which is not).  The diviner pass patches
 // bytes IN THE FILE, so a BSS location wouldn't work.  The initial
 // magic "JANOSCRT" makes the presence of the slot visible in a hex
-// dump even before the diviner runs; the version byte (offset 8) is
-// 0 on undivined builds and gets bumped to janos_cert.Version by the
-// diviner pass once the chain is populated.
+// dump even before the diviner runs.
 //
 // The variable's SYMBOL NAME (runtime.janosCertSlotBytes) is
 // significant — the diviner pass looks it up by name.  Do not rename
@@ -48,47 +38,26 @@ var janosCertSlotBytes = [janosCertSlotStorageSize]byte{
 	// tail (1360..2047) is left permanently zero for future extension.
 }
 
+// janosExpectedGuildPubKey holds the Ed25519 public key of the Guild
+// this runtime was built to recognise.  Patched by cmd/link's diviner
+// pass from the signet's guild_pubkey field.  All-zero on an
+// undivined build; a divined binary with a zero key here is a
+// build-system bug and janosVerifyCertSlot throws.
+//
+// Symbol name (runtime.janosExpectedGuildPubKey) is significant — the
+// diviner pass looks it up.
+var janosExpectedGuildPubKey = [32]byte{}
+
+// janosExpectedReleasePubKey holds the Ed25519 public key of the
+// Release this runtime was built to recognise.  Patched by cmd/link's
+// diviner pass from the signet's release_pubkey field.
+var janosExpectedReleasePubKey = [32]byte{}
+
 // janosCertSlot returns the runtime's own JANOSCRT slot bytes.
-// Empty (all-zero) on an undivined build; carries the chain of
-// trust on a properly divined one.
 //
 //go:nosplit
 func janosCertSlot() *[janosCertSlotStorageSize]byte {
 	return &janosCertSlotBytes
-}
-
-// janosVerifyCertSlot runs at schedinit after the self-hash pass.
-// On an undivined build the slot is all-zero and this function is a
-// no-op.  On a divined build (once the diviner pass lands in cmd/link)
-// it will verify the Guild+Release chain via internal/runtime/janos_cert
-// and throw on failure.  Referencing janosCertSlotBytes here also
-// keeps the symbol alive against dead-code elimination — the diviner
-// pass in cmd/link needs the slot present in the binary to patch it.
-//
-// The runtime.KeepAlive-style read through a package-level function
-// pointer prevents the compiler from const-folding the all-zero
-// initial contents into a compile-time constant; the diviner pass in
-// cmd/link may patch the bytes after the compiler has finished, and
-// we need those reads to hit real memory.
-//
-//go:noinline
-//go:nosplit
-func janosVerifyCertSlot() {
-	// The slot has "JANOSCRT" magic pre-baked (see initializer above),
-	// so the version byte is what tells us whether the diviner has
-	// populated the chain.  Indirected through janosSlotVersionByte
-	// so the compiler cannot prove at compile time what value the
-	// diviner will patch in.
-	v := janosSlotVersionByte()
-	if v == 0 {
-		// Undivined binary — no chain to verify.  Boot continues.
-		return
-	}
-	// TODO(task #57): compute SHA-256 of the running binary with the
-	// slot region zeroed, then linkname over to
-	// internal/runtime/janos_cert.VerifyChain, then throw on any
-	// failure.
-	_ = v
 }
 
 // janosSlotVersionByte returns the version byte of the JANOSCRT slot
@@ -101,4 +70,75 @@ func janosVerifyCertSlot() {
 //go:nosplit
 func janosSlotVersionByte() byte {
 	return janosCertSlotBytes[8]
+}
+
+// janosVerifyChainHook is called by janosVerifyCertSlot at schedinit
+// to verify the JANOSCRT slot's chain of trust.  When nil (default),
+// verification is skipped entirely — undivined builds and the
+// current bootstrapping state.
+//
+// When a divined-binary bring-up path wires up cert verification
+// end-to-end, an init in an imported package will populate this via
+// runtime.SetJanosVerifyChainHook (declared in janos_cert_slot_hook.go)
+// with a closure that calls janos_cert.VerifyChain and returns whether
+// the slot was accepted.  The runtime side stays crypto-free; the
+// crypto lives at the janos_cert layer where it belongs.
+var janosVerifyChainHook func(slot []byte, guildPK, releasePK [32]byte) bool
+
+// SetJanosVerifyChainHook installs the schedinit-time cert-chain
+// verifier.  Called from janos_cert's init() (once wired) to bridge
+// runtime and the crypto-heavy verifier without a hard import
+// dependency.  Idempotent within a process — the first call wins;
+// subsequent calls are ignored.  Not intended for user code.
+//
+//go:nosplit
+func SetJanosVerifyChainHook(fn func(slot []byte, guildPK, releasePK [32]byte) bool) {
+	if janosVerifyChainHook == nil {
+		janosVerifyChainHook = fn
+	}
+}
+
+// janosVerifyCertSlot runs at schedinit after the self-hash pass.
+// Behaviour:
+//
+//   - Undivined build (version byte 0): no-op.  Runtime boots normally.
+//   - Divined build (version byte > 0) with hook installed AND chain
+//     valid: bumps the current g's TrustLevel to TrustJanosReleased
+//     and returns.  Inheritance to child goroutines happens naturally
+//     via the newproc1 provenance copy.
+//   - Divined build with no hook installed: throw.  A JanOS binary
+//     that claims a chain but has no verifier to check it against is
+//     a build configuration bug.
+//   - Divined build with a chain that fails verification: throw.
+//
+//go:noinline
+//go:nosplit
+func janosVerifyCertSlot() {
+	if janosSlotVersionByte() == 0 {
+		return // undivined build; nothing to check
+	}
+
+	// Divined binary.  A hook MUST be installed.
+	if janosVerifyChainHook == nil {
+		throw("janos: JANOSCRT slot is divined but no verifier hook is registered — this runtime was not built with cert-verify wiring")
+	}
+
+	// Expected keys MUST have been patched by the diviner pass.  Zero
+	// values mean the runtime was NOT built with a matching diviner
+	// configuration, and running a divined binary through it is
+	// inconsistent.
+	zero := [32]byte{}
+	if janosExpectedGuildPubKey == zero || janosExpectedReleasePubKey == zero {
+		throw("janos: JANOSCRT slot is divined but expected Guild/Release keys are not baked into the runtime")
+	}
+
+	if !janosVerifyChainHook(janosCertSlotBytes[:],
+		janosExpectedGuildPubKey, janosExpectedReleasePubKey) {
+		throw("janos: JANOSCRT chain verification failed")
+	}
+
+	// Bump this g's trust level; child goroutines inherit via
+	// gProvenance copy at newproc1.
+	gp := getg()
+	gp.provenance.trustLevel = TrustJanosReleased
 }

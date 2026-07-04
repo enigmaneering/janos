@@ -39,6 +39,15 @@ func JanosSHA512ForTest(p []byte) [64]byte {
 	return d.Sum()
 }
 
+// SetJanosVerifyChainHookForTest installs / clears the schedinit
+// cert-verify hook that the runtime calls from janosVerifyCertSlot.
+// Tests use this to exercise the divined-boot code path without
+// wiring up the real janos_cert crypto (which lives outside
+// runtime).
+func SetJanosVerifyChainHookForTest(fn func(slot []byte, guildPK, releasePK [32]byte) bool) {
+	janosVerifyChainHook = fn
+}
+
 // SetJanosCertificatesForTest populates the process-wide Guild/
 // Release/User cert storage without going through the real schedinit
 // verification path.  Also updates the calling goroutine's cert IDs

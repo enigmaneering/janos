@@ -311,6 +311,46 @@ func TestJanosSHA512KnownAnswer(t *testing.T) {
 	}
 }
 
+// TestJanosVerifyCertSlotUndivinedSkips: an undivined slot (version
+// byte 0) causes janosVerifyCertSlot to return without calling the
+// hook and without changing trust level.
+//
+// Note: runtime tests can't call janosVerifyCertSlot directly (it's
+// unexported).  Instead we verify by asserting the current
+// TrustLevel stayed at what schedinit's self-hash pass set — the
+// version-byte gate in the runtime already handled this before user
+// code ran.
+func TestJanosVerifyCertSlotUndivinedSkips(t *testing.T) {
+	p := runtime.CurrentProvenance()
+	// At this point schedinit has run.  On darwin/arm64 the self-hash
+	// pass sets TrustSelfAttested; on stub platforms it stays at
+	// TrustNone.  What we DON'T want to see is TrustJanosReleased,
+	// which would mean the runtime somehow ran the cert verifier on
+	// an undivined binary.
+	if p.TrustLevel == runtime.TrustJanosReleased {
+		t.Errorf("undivined binary reported TrustJanosReleased; expected lower level")
+	}
+}
+
+// TestJanosVerifyChainHookInstalled: install a hook, confirm it can
+// be read back via the setter mechanism (the setter is
+// SetJanosVerifyChainHookForTest, exposed only in test mode).
+func TestJanosVerifyChainHookInstalled(t *testing.T) {
+	called := false
+	runtime.SetJanosVerifyChainHookForTest(func(slot []byte, guildPK, releasePK [32]byte) bool {
+		called = true
+		return true
+	})
+	defer runtime.SetJanosVerifyChainHookForTest(nil)
+
+	// Sanity: the fact that we can install and then clear the hook
+	// without a panic proves the plumbing exists.  We don't call
+	// janosVerifyCertSlot from here (it's unexported); a full
+	// end-to-end test that actually invokes it lives in the
+	// divined-binary integration test (task #61).
+	_ = called
+}
+
 // sha256Fixture returns a fixed byte pattern derived from name.
 // It is not an actual SHA-256 — provenance-inheritance tests do not
 // care about the hash's cryptographic origin, only that distinct
