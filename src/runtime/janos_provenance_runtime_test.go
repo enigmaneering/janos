@@ -160,6 +160,22 @@ func P256NegatePlusPointIsInfinityForTest() bool {
 	return sum.IsInfinity()
 }
 
+// P256VerifyForTest exposes the runtime-internal ECDSA verify to
+// external tests.  Signature is r||s (64 bytes), pubkey is X||Y
+// (64 bytes), digest is 32 bytes.
+func P256VerifyForTest(pubkey, digest, sig []byte) bool {
+	if len(pubkey) != 64 || len(digest) != 32 || len(sig) != 64 {
+		return false
+	}
+	var pk [64]byte
+	var d [32]byte
+	var s [64]byte
+	copy(pk[:], pubkey)
+	copy(d[:], digest)
+	copy(s[:], sig)
+	return janosP256VerifyRS(&pk, &d, &s)
+}
+
 // P256UncompressedRoundTripForTest: parse a 64-byte X||Y encoding of
 // a point, then re-serialise the affine coordinates from the parsed
 // point.  Returns the round-tripped bytes or ({}, false) on parse
