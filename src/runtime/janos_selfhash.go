@@ -137,21 +137,33 @@ func janosMunmap(buf []byte, size int) {
 }
 
 // janosHashCanonical computes the digest of buf with the JanOS
-// canonicalisation applied.  buf is mutated in place — the caller's
-// mmap region is discarded shortly after this returns, so the
-// mutations don't matter.  Steps mirror what the diviner does:
+// canonicalisation applied, using the current runtime's expected
+// Guild/Release pubkey patterns.  Wrapper around janosCanonicalHash
+// for the production call site; tests use janosCanonicalHash
+// directly so they can inject arbitrary patterns.
+func janosHashCanonical(buf []byte) [32]byte {
+	return janosCanonicalHash(buf,
+		janosExpectedGuildPubKey[:],
+		janosExpectedReleasePubKey[:])
+}
+
+// janosCanonicalHash computes the digest of buf after zeroing the
+// regions that both the diviner (via cmd/internal/buildid.FindAnd-
+// Hash + explicit slot/expected-key zeros) and the runtime need to
+// agree on.  buf is mutated in place — the caller's mmap region is
+// discarded shortly after this returns, so the mutations don't
+// matter.  Steps:
 //
 //	1. Locate the JANOSCRT slot (divined magic + version 1) and
 //	   zero its 2 KiB.
-//	2. Locate every occurrence of the current janosExpectedGuild-
-//	   PubKey and janosExpectedReleasePubKey byte patterns and zero
-//	   those.
+//	2. Zero every occurrence of guildKey and releaseKey byte
+//	   patterns.
 //	3. Parse the Mach-O header, if present, and zero the LC_CODE_
 //	   SIGNATURE data range and the LC_UUID 16-byte UUID region.
 //	4. Find the Go build ID marker `\xff Go build ID: "..."\n \xff`,
 //	   extract the ID, and zero every occurrence of it.
 //	5. SHA-256 the result.
-func janosHashCanonical(buf []byte) [32]byte {
+func janosCanonicalHash(buf, guildKey, releaseKey []byte) [32]byte {
 	// Step 1: JANOSCRT divined slot.
 	if off, ok := janosLocateDivinedSlot(buf); ok {
 		end := off + janosCertSlotStorageSize
@@ -164,8 +176,8 @@ func janosHashCanonical(buf []byte) [32]byte {
 	}
 
 	// Step 2: expected pubkey positions.
-	janosZeroAll(buf, janosExpectedGuildPubKey[:])
-	janosZeroAll(buf, janosExpectedReleasePubKey[:])
+	janosZeroAll(buf, guildKey)
+	janosZeroAll(buf, releaseKey)
 
 	// Step 3: Mach-O codesig + LC_UUID.
 	janosZeroMachoExcludes(buf)

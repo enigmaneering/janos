@@ -284,3 +284,14 @@ func certIDForTest(pk [64]byte) [32]byte {
 	d.Write(pk[:])
 	return d.Sum()
 }
+
+// JanosCanonicalHashForTest exposes the runtime-internal canonical
+// hasher to external tests, letting the test file inject its own
+// Guild/Release pubkey patterns.  The production wrapper
+// janosHashCanonical always uses the runtime's own janos-
+// ExpectedGuild/ReleasePubKey vars; tests need to vary those.  Note
+// that buf is mutated in place — callers should pass a fresh copy
+// if they want to reuse the fixture.
+func JanosCanonicalHashForTest(buf, guildKey, releaseKey []byte) [32]byte {
+	return janosCanonicalHash(buf, guildKey, releaseKey)
+}
