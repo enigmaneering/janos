@@ -12,6 +12,52 @@ package runtime
 
 import "internal/runtime/janos_hash"
 
+// P256FieldOpsForTest exposes the runtime-internal P-256 field
+// element type to external tests.  Returns a fresh Element+bool
+// pair for SetBytes; and Add/Sub/Mul/Square/Invert/Bytes helpers so
+// the external test file can drive the field type without duplicating
+// the wrapper.  All operations are stack-friendly (return values, no
+// heap allocs).
+func P256FieldFromBytesForTest(v []byte) ([32]byte, bool) {
+	var e janosP256Element
+	if _, ok := e.SetBytes(v); !ok {
+		return [32]byte{}, false
+	}
+	return e.Bytes(), true
+}
+
+// P256FieldMulForTest returns (a * b mod p) as 32 big-endian bytes,
+// or (zeros, false) if either input is not a canonical field element.
+func P256FieldMulForTest(a, b []byte) ([32]byte, bool) {
+	var ae, be, out janosP256Element
+	if _, ok := ae.SetBytes(a); !ok {
+		return [32]byte{}, false
+	}
+	if _, ok := be.SetBytes(b); !ok {
+		return [32]byte{}, false
+	}
+	out.Mul(&ae, &be)
+	return out.Bytes(), true
+}
+
+// P256FieldInvertForTest returns (1/a mod p) as 32 big-endian bytes,
+// or zero if a is zero.
+func P256FieldInvertForTest(a []byte) ([32]byte, bool) {
+	var ae, out janosP256Element
+	if _, ok := ae.SetBytes(a); !ok {
+		return [32]byte{}, false
+	}
+	out.Invert(&ae)
+	return out.Bytes(), true
+}
+
+// P256FieldOneForTest returns the multiplicative identity as 32 bytes.
+func P256FieldOneForTest() [32]byte {
+	var e janosP256Element
+	e.One()
+	return e.Bytes()
+}
+
 // CurrentInstanceIDHexForTest returns the running goroutine's
 // InstanceID as a 32-char hex string.  Test-only helper so
 // TestInstanceIDDistinctAcrossRuns can print and compare without
