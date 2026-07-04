@@ -12,6 +12,21 @@ package runtime
 
 import "internal/runtime/janos_hash"
 
+// CurrentInstanceIDHexForTest returns the running goroutine's
+// InstanceID as a 32-char hex string.  Test-only helper so
+// TestInstanceIDDistinctAcrossRuns can print and compare without
+// importing encoding/hex into runtime tests.
+func CurrentInstanceIDHexForTest() string {
+	id := CurrentProvenance().InstanceID
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, len(id)*2)
+	for i, b := range id {
+		out[i*2] = hexChars[b>>4]
+		out[i*2+1] = hexChars[b&0xf]
+	}
+	return string(out)
+}
+
 // SetCurrentProvenanceForTest overwrites the current goroutine's
 // provenance.  Snapshot the value before calling and restore it in a
 // deferred call to avoid polluting other tests.
