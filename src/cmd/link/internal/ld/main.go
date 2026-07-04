@@ -486,13 +486,21 @@ func Main(arch *sys.Arch, theArch Arch) {
 	bench.Start("Asmb2")
 	asmb2(ctxt)
 
+	// JanOS: family-line inheritance — copies THIS running janos's
+	// own expected Guild/Release public keys into the colonel being
+	// linked, so any colonel of a divined janos automatically enforces
+	// the same family line even if -janos-diviner wasn't passed.
+	// Bootstrap runtimes (zero expected keys) inherit zero and stay
+	// in permissive mode.
+	bench.Start("JanosInheritParent")
+	janosInheritParentKeysIntoOutput(ctxt)
+
 	// JanOS: post-link diviner pass — seals this binary's identity
 	// into its JANOSCRT slot by computing SHA-256 of the assembled
 	// image (with the slot zeroed) and asking the configured KMS-
-	// backed diviner to sign the digest.  Empty flag skips the pass
-	// (dev builds).  janosDivinerPass is a no-op stub in this
-	// commit; sub-tasks B and C will fill it in with real hashing
-	// and KMS invocation.
+	// backed diviner to sign the digest.  Overrides the parent-key
+	// inheritance above with the signet's authoritative values.
+	// Empty flag skips the pass (relies solely on inheritance).
 	bench.Start("JanosDiviner")
 	if *flagJanosDiviner != "" {
 		janosDivinerPass(ctxt, *flagJanosDiviner)

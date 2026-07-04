@@ -60,6 +60,20 @@ func janosCertSlot() *[janosCertSlotStorageSize]byte {
 	return &janosCertSlotBytes
 }
 
+// JanosParentKeys returns the Ed25519 public keys of the Guild and
+// Release the currently running JanOS runtime was built to
+// recognise.  Both zero on an undivined (bootstrap) runtime.
+//
+// Used by cmd/link's post-link auto-inherit step to bake the current
+// janos binary's family-line keys into every colonel it produces —
+// so a colonel of a divined janos automatically enforces the same
+// family line even if the operator didn't pass -janos-diviner.
+// User code has no legitimate reason to call this; it is exposed
+// only for the toolchain.
+func JanosParentKeys() (guild, release [32]byte) {
+	return janosExpectedGuildPubKey, janosExpectedReleasePubKey
+}
+
 // janosSlotVersionByte returns the version byte of the JANOSCRT slot
 // (offset 8, right after the "JANOSCRT" magic).  Indirected through
 // this small no-inline function so the compiler cannot prove the
@@ -99,37 +113,54 @@ func SetJanosVerifyChainHook(fn func(slot []byte, guildPK, releasePK [32]byte) b
 }
 
 // janosVerifyCertSlot runs at schedinit after the self-hash pass.
-// Behaviour:
+// Uses a hybrid policy keyed on whether this runtime has expected
+// Guild/Release keys baked in:
 //
-//   - Undivined build (version byte 0): no-op.  Runtime boots normally.
-//   - Divined build (version byte > 0) with hook installed AND chain
-//     valid: bumps the current g's TrustLevel to TrustJanosReleased
-//     and returns.  Inheritance to child goroutines happens naturally
-//     via the newproc1 provenance copy.
-//   - Divined build with no hook installed: throw.  A JanOS binary
-//     that claims a chain but has no verifier to check it against is
-//     a build configuration bug.
-//   - Divined build with a chain that fails verification: throw.
+//   - Bootstrap mode (expected keys all zero): permissive.  Runtime
+//     boots regardless of slot state.  This is the state of a
+//     stock-Go-built janos-v0 or a colonel of an undivined janos —
+//     no family line has been declared, so the runtime enforces
+//     nothing.  TrustLevel stays at whatever the self-hash pass
+//     set (TrustSelfAttested on platforms with a reader, TrustNone
+//     on stubs).
+//
+//   - Strict mode (expected keys non-zero): runtime has been
+//     assigned a family line.  Every colonel produced through it
+//     inherits those keys automatically at link time.  So:
+//       * Slot version byte 0 (undivined): throw.  This colonel
+//         claims to belong to this family line but has no chain
+//         to prove it — either the operator forgot to invoke
+//         -janos-diviner or someone stripped the slot.
+//       * Slot version byte > 0 with no verifier hook installed:
+//         throw.  A runtime declaring family membership must
+//         carry the verifier; this one didn't get the bridge
+//         wired.
+//       * Slot version > 0 with a valid chain: bump TrustLevel to
+//         TrustJanosReleased.  Descendants inherit via the
+//         gProvenance copy at newproc1.
+//       * Slot version > 0 with an invalid chain: throw.
 //
 //go:noinline
 //go:nosplit
 func janosVerifyCertSlot() {
-	if janosSlotVersionByte() == 0 {
-		return // undivined build; nothing to check
+	zero := [32]byte{}
+	if janosExpectedGuildPubKey == zero && janosExpectedReleasePubKey == zero {
+		// Bootstrap mode: no family line declared, nothing to enforce.
+		return
 	}
 
-	// Divined binary.  A hook MUST be installed.
+	// Strict mode below.  Both expected keys must be non-zero (a
+	// partial declaration is a build-system bug).
+	if janosExpectedGuildPubKey == zero || janosExpectedReleasePubKey == zero {
+		throw("janos: only one of Guild/Release expected keys is baked in — build-system bug")
+	}
+
+	if janosSlotVersionByte() == 0 {
+		throw("janos: this runtime is divined but the JANOSCRT slot is not — colonels of a divined janos must be divined too")
+	}
+
 	if janosVerifyChainHook == nil {
 		throw("janos: JANOSCRT slot is divined but no verifier hook is registered — this runtime was not built with cert-verify wiring")
-	}
-
-	// Expected keys MUST have been patched by the diviner pass.  Zero
-	// values mean the runtime was NOT built with a matching diviner
-	// configuration, and running a divined binary through it is
-	// inconsistent.
-	zero := [32]byte{}
-	if janosExpectedGuildPubKey == zero || janosExpectedReleasePubKey == zero {
-		throw("janos: JANOSCRT slot is divined but expected Guild/Release keys are not baked into the runtime")
 	}
 
 	if !janosVerifyChainHook(janosCertSlotBytes[:],

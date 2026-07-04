@@ -311,24 +311,24 @@ func TestJanosSHA512KnownAnswer(t *testing.T) {
 	}
 }
 
-// TestJanosVerifyCertSlotUndivinedSkips: an undivined slot (version
-// byte 0) causes janosVerifyCertSlot to return without calling the
-// hook and without changing trust level.
+// TestJanosVerifyCertSlotBootstrapSkips: on a bootstrap runtime (no
+// baked-in expected Guild/Release keys), schedinit's cert-slot check
+// runs but returns without changing TrustLevel — the runtime hasn't
+// been assigned a family line so there's nothing to enforce.
 //
-// Note: runtime tests can't call janosVerifyCertSlot directly (it's
-// unexported).  Instead we verify by asserting the current
-// TrustLevel stayed at what schedinit's self-hash pass set — the
-// version-byte gate in the runtime already handled this before user
-// code ran.
-func TestJanosVerifyCertSlotUndivinedSkips(t *testing.T) {
+// This test runs against a stock-Go-built janos toolchain (which is
+// what `./make.bash` produces for the current runtime).  All expected
+// keys are zero, so the hybrid gate takes the bootstrap-permissive
+// path and TrustLevel stays at whatever the self-hash pass set.
+func TestJanosVerifyCertSlotBootstrapSkips(t *testing.T) {
 	p := runtime.CurrentProvenance()
 	// At this point schedinit has run.  On darwin/arm64 the self-hash
 	// pass sets TrustSelfAttested; on stub platforms it stays at
 	// TrustNone.  What we DON'T want to see is TrustJanosReleased,
 	// which would mean the runtime somehow ran the cert verifier on
-	// an undivined binary.
+	// an undivined bootstrap binary.
 	if p.TrustLevel == runtime.TrustJanosReleased {
-		t.Errorf("undivined binary reported TrustJanosReleased; expected lower level")
+		t.Errorf("bootstrap binary reported TrustJanosReleased; expected lower level")
 	}
 }
 

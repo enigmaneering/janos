@@ -167,6 +167,25 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 	}
 }
 
+// janosInheritParentKeysIntoOutput is declared in a per-build-tag
+// file so bootstrap-copied cmd/link (compiled against stock Go's
+// runtime, which lacks runtime.JanosParentKeys) can compile with a
+// no-op stub, while non-bootstrap cmd/link uses the full
+// implementation that reads its own parent's keys.  See
+// janos_inherit_ok.go and janos_inherit_bootstrap.go.
+
+// patchRuntimeKeyIfPresent is patchRuntimeKey but returns nil when
+// the symbol is not found (rather than erroring).  Used by the
+// inherit step, which shouldn't fail on non-JanOS-runtime outputs.
+func patchRuntimeKeyIfPresent(ctxt *Link, symName string, value []byte) error {
+	ldr := ctxt.loader
+	s := ldr.Lookup(symName, 0)
+	if s == 0 {
+		return nil // absent = "not a JanOS-runtime binary"; skip silently
+	}
+	return patchRuntimeKey(ctxt, symName, value)
+}
+
 // patchRuntimeKey overwrites the bytes at the named runtime symbol
 // with value.  The symbol must be an initialized array of the same
 // length as value (32 bytes for a pubkey).
