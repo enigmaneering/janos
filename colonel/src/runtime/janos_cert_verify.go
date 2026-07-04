@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // JanOS: JANOSCRT slot decode + chain-of-trust verification.
 //
 // The slot's wire format is defined in cmd/janos/certslot.  The

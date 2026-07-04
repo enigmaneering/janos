@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Test-only helpers that live in the runtime package so external tests
 // can reach package-internal state.  Production code has no setter
 // for provenance — it is entirely runtime-driven — so this file

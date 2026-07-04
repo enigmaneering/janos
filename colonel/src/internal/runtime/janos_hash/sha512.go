@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // SHA-512 for the janos_hash package.  See sha256.go for the general
 // design notes; SHA-512 is the same shape with 128-byte blocks, 80
 // rounds, 8x64-bit state.

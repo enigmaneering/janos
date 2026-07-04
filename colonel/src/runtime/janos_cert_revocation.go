@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // JanOS: baked-in revocation list.
 //
 // Each JanOS runtime carries a list of Release and User certificates

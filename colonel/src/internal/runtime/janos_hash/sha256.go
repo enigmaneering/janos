@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package janos_hash provides minimal SHA-256 and SHA-512
 // implementations for use inside the runtime and by other packages
 // that sit below crypto in the import graph.

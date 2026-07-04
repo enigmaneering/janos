@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package signet parses the JanOS repo's `signet` file, which
 // declares the KMS-backed signing keys the toolchain uses during a
 // build.  cmd/link reads it at link time to know:

@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package certslot defines the on-disk layout of the JANOSCRT slot
 // and provides a bootstrap-safe encoder used by both the runtime and
 // cmd/link's diviner pass.

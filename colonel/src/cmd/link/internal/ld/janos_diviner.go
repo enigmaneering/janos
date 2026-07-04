@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // JanOS: cmd/link diviner pass.
 //
 // A "diviner" is the KMS-backed signing pass invoked at the very end

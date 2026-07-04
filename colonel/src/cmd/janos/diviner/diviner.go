@@ -1,7 +1,3 @@
-// Copyright The Enigmaneering Guild. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
 // Package diviner defines the interface every KMS-backed signing
 // backend implements for the JanOS toolchain, plus a URL-scheme
 // registry that lets cmd/link's diviner pass dispatch to the right
