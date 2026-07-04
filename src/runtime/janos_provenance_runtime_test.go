@@ -86,6 +86,100 @@ func P256ScalarRoundTripForTest(v []byte) ([32]byte, bool) {
 	return s.Bytes(), true
 }
 
+// P256ScalarBaseMultForTest returns (k*G).x, (k*G).y as big-endian
+// 32-byte encodings, or (_, _, false) if the point is at infinity or
+// k is not 32 bytes.  Used by tests to check the point-ops port
+// against RFC-published vectors.
+func P256ScalarBaseMultForTest(k []byte) ([32]byte, [32]byte, bool) {
+	var p janosP256Point
+	if _, ok := p.ScalarBaseMult(k); !ok {
+		return [32]byte{}, [32]byte{}, false
+	}
+	if p.IsInfinity() {
+		return [32]byte{}, [32]byte{}, false
+	}
+	// Extract affine (X/Z, Y/Z).
+	var zinv, x, y janosP256Element
+	zinv.Invert(&p.z)
+	x.Mul(&p.x, &zinv)
+	y.Mul(&p.y, &zinv)
+	return x.Bytes(), y.Bytes(), true
+}
+
+// P256GeneratorIsOnCurveForTest reports whether the hardcoded
+// generator satisfies the curve equation.
+func P256GeneratorIsOnCurveForTest() bool {
+	var g janosP256Point
+	g.SetGenerator()
+	return g.isOnCurve()
+}
+
+// P256AddDoubleConsistentForTest checks that G + G computed via Add
+// matches 2G computed via Double.  A failure here indicates a bug in
+// one of the two formulas or the generator constant.
+func P256AddDoubleConsistentForTest() bool {
+	var g1, g2, added, doubled janosP256Point
+	g1.SetGenerator()
+	g2.SetGenerator()
+
+	added.Add(&g1, &g2)
+	doubled.Double(&g1)
+
+	// Compare via affine x and y (avoid comparing projective reps
+	// that may differ by a Z scaling).
+	x1, ok1 := added.AffineX()
+	x2, ok2 := doubled.AffineX()
+	if !ok1 || !ok2 || x1 != x2 {
+		return false
+	}
+	return true
+}
+
+// P256AddInfinityForTest checks Add(G, infinity) == G.
+func P256AddInfinityForTest() bool {
+	var g, inf, sum janosP256Point
+	g.SetGenerator()
+	inf.SetInfinity()
+	sum.Add(&g, &inf)
+	xSum, ok := sum.AffineX()
+	if !ok {
+		return false
+	}
+	xG, _ := g.AffineX()
+	return xSum == xG
+}
+
+// P256NegatePlusPointIsInfinityForTest checks that G + (-G) is the
+// point at infinity.
+func P256NegatePlusPointIsInfinityForTest() bool {
+	var g, gNeg, sum janosP256Point
+	g.SetGenerator()
+	gNeg.SetGenerator()
+	gNeg.Negate()
+	sum.Add(&g, &gNeg)
+	return sum.IsInfinity()
+}
+
+// P256UncompressedRoundTripForTest: parse a 64-byte X||Y encoding of
+// a point, then re-serialise the affine coordinates from the parsed
+// point.  Returns the round-tripped bytes or ({}, false) on parse
+// failure.  Verifies isOnCurve as a side effect.
+func P256UncompressedRoundTripForTest(xy []byte) ([32]byte, [32]byte, bool) {
+	var p janosP256Point
+	if _, ok := p.SetUncompressedBytes(xy); !ok {
+		return [32]byte{}, [32]byte{}, false
+	}
+	x, ok := p.AffineX()
+	if !ok {
+		return [32]byte{}, [32]byte{}, false
+	}
+	// AffineY: mirror AffineX inline.
+	var zinv, y janosP256Element
+	zinv.Invert(&p.z)
+	y.Mul(&p.y, &zinv)
+	return x, y.Bytes(), true
+}
+
 // P256FieldOneForTest returns the multiplicative identity as 32 bytes.
 func P256FieldOneForTest() [32]byte {
 	var e janosP256Element

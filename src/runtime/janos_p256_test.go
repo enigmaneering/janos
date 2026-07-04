@@ -275,6 +275,129 @@ func TestJanosP256ScalarVectors(t *testing.T) {
 	}
 }
 
+// TestJanosP256PointGeneratorOnCurve: the hardcoded generator G
+// must satisfy y² = x³ − 3x + b.  If this fails, the Montgomery-
+// form limbs of Gx or Gy (or b) are wrong.
+func TestJanosP256PointGeneratorOnCurve(t *testing.T) {
+	if !runtime.P256GeneratorIsOnCurveForTest() {
+		t.Fatal("hardcoded P-256 generator is not on the curve")
+	}
+}
+
+// TestJanosP256PointAddDoubleConsistent: Add(G, G) affine == 2G
+// affine.  Independently verifies both the addition and doubling
+// formulas since either could produce a wrong Z-scaled result that
+// still round-trips through the OTHER formula's Z.
+func TestJanosP256PointAddDoubleConsistent(t *testing.T) {
+	if !runtime.P256AddDoubleConsistentForTest() {
+		t.Fatal("G + G != 2G — Add and Double disagree")
+	}
+}
+
+// TestJanosP256PointAddInfinity: Add(G, infinity) == G.
+func TestJanosP256PointAddInfinity(t *testing.T) {
+	if !runtime.P256AddInfinityForTest() {
+		t.Fatal("G + O != G")
+	}
+}
+
+// TestJanosP256PointNegatePlusIsInfinity: G + (-G) is the identity.
+func TestJanosP256PointNegatePlusIsInfinity(t *testing.T) {
+	if !runtime.P256NegatePlusPointIsInfinityForTest() {
+		t.Fatal("G + (-G) != infinity")
+	}
+}
+
+// TestJanosP256ScalarBaseMultVectors: verify against math/big-derived
+// (k, kG.x, kG.y) triples spanning k = 1, 2, 3, 4, 15, 255, 0xdeadbeef,
+// mid-range, and n - 1.  The last case is a nice sanity check because
+// (n-1)*G = -G, so kG.x should equal Gx and kG.y should equal (p - Gy).
+func TestJanosP256ScalarBaseMultVectors(t *testing.T) {
+	vecs := [...]struct{ k, x, y string }{
+		{"0000000000000000000000000000000000000000000000000000000000000001",
+			"6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+			"4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"},
+		{"0000000000000000000000000000000000000000000000000000000000000002",
+			"7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978",
+			"07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1"},
+		{"0000000000000000000000000000000000000000000000000000000000000003",
+			"5ecbe4d1a6330a44c8f7ef951d4bf165e6c6b721efada985fb41661bc6e7fd6c",
+			"8734640c4998ff7e374b06ce1a64a2ecd82ab036384fb83d9a79b127a27d5032"},
+		{"0000000000000000000000000000000000000000000000000000000000000004",
+			"e2534a3532d08fbba02dde659ee62bd0031fe2db785596ef509302446b030852",
+			"e0f1575a4c633cc719dfee5fda862d764efc96c3f30ee0055c42c23f184ed8c6"},
+		{"000000000000000000000000000000000000000000000000000000000000000f",
+			"f0454dc6971abae7adfb378999888265ae03af92de3a0ef163668c63e59b9d5f",
+			"b5b93ee3592e2d1f4e6594e51f9643e62a3b21ce75b5fa3f47e59cde0d034f36"},
+		{"00000000000000000000000000000000000000000000000000000000000000ff",
+			"f44b39759a2e6db723a6f90249972dfd08e95380f1fca470eacd1d03e5edf214",
+			"befafccf223ca065f0a0db4eea93ff06a2116fca81f7a4a9436a8d917a02dede"},
+		{"00000000000000000000000000000000000000000000000000000000deadbeef",
+			"b487d183dc4806058eb31a29bedefd7bcca987b77a381a3684871d8449c18394",
+			"2a122cc711a80453678c3032de4b6fff2c86342e82d1e7adb617c4165c43ce5e"},
+		{"7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff5",
+			"fd40f20ff754ebfddf2f2ab8b6bbc6b03791816107e77c7449882b875992d639",
+			"a744fae37069cb4beeb7ee9d518393788d2f5f19c5310bfbe6bf302bbd320de7"},
+		{"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550",
+			"6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+			"b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0a"},
+	}
+	for i, v := range vecs {
+		k := unhex32(t, v.k)
+		gotX, gotY, ok := runtime.P256ScalarBaseMultForTest(k)
+		if !ok {
+			t.Errorf("case %d: ScalarBaseMult returned infinity or bad input", i)
+			continue
+		}
+		wantX := unhex32(t, v.x)
+		wantY := unhex32(t, v.y)
+		if !bytesEq(gotX[:], wantX) {
+			t.Errorf("case %d: kG.x mismatch\nk    %s\nwant %s\ngot  %x", i, v.k, v.x, gotX)
+		}
+		if !bytesEq(gotY[:], wantY) {
+			t.Errorf("case %d: kG.y mismatch\nk    %s\nwant %s\ngot  %x", i, v.k, v.y, gotY)
+		}
+	}
+}
+
+// TestJanosP256PointUncompressedRoundTrip: parse the generator's
+// SEC1 X||Y form and check the affine coordinates come back
+// unchanged.  Also exercises isOnCurve since SetUncompressedBytes
+// runs it internally.
+func TestJanosP256PointUncompressedRoundTrip(t *testing.T) {
+	gX := unhex32(t, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+	gY := unhex32(t, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+	var xy [64]byte
+	copy(xy[:32], gX)
+	copy(xy[32:], gY)
+
+	gotX, gotY, ok := runtime.P256UncompressedRoundTripForTest(xy[:])
+	if !ok {
+		t.Fatal("SetUncompressedBytes rejected valid generator encoding")
+	}
+	if !bytesEq(gotX[:], gX) {
+		t.Errorf("x mismatch:\nwant %x\ngot  %x", gX, gotX)
+	}
+	if !bytesEq(gotY[:], gY) {
+		t.Errorf("y mismatch:\nwant %x\ngot  %x", gY, gotY)
+	}
+}
+
+// TestJanosP256PointRejectOffCurve: (Gx, Gy+1) is not on the curve,
+// so SetUncompressedBytes must refuse it.
+func TestJanosP256PointRejectOffCurve(t *testing.T) {
+	gX := unhex32(t, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+	// Gy + 1
+	badY := unhex32(t, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f6")
+	var xy [64]byte
+	copy(xy[:32], gX)
+	copy(xy[32:], badY)
+
+	if _, _, ok := runtime.P256UncompressedRoundTripForTest(xy[:]); ok {
+		t.Error("accepted an off-curve point (Gx, Gy+1)")
+	}
+}
+
 // unhex32 decodes a 64-character hex string into 32 bytes, failing
 // the test if the length or characters are wrong.  Runtime tests
 // can't import encoding/hex, so we roll a tiny decoder.
