@@ -51,6 +51,41 @@ func P256FieldInvertForTest(a []byte) ([32]byte, bool) {
 	return out.Bytes(), true
 }
 
+// P256ScalarMulForTest returns (a * b mod n) as 32 big-endian bytes,
+// or ([32]byte{}, false) if either input is not 32 bytes.
+func P256ScalarMulForTest(a, b []byte) ([32]byte, bool) {
+	var as, bs, out janosP256Scalar
+	if _, ok := as.SetBytesBE(a); !ok {
+		return [32]byte{}, false
+	}
+	if _, ok := bs.SetBytesBE(b); !ok {
+		return [32]byte{}, false
+	}
+	out.Mul(&as, &bs)
+	return out.Bytes(), true
+}
+
+// P256ScalarInvertForTest returns (1/x mod n) as 32 big-endian bytes.
+// If x is zero, returns [32]byte{}, true.
+func P256ScalarInvertForTest(x []byte) ([32]byte, bool) {
+	var xs, out janosP256Scalar
+	if _, ok := xs.SetBytesBE(x); !ok {
+		return [32]byte{}, false
+	}
+	out.Invert(&xs)
+	return out.Bytes(), true
+}
+
+// P256ScalarRoundTripForTest: SetBytesBE(v) then Bytes().  Useful for
+// confirming the encode/decode paths agree.
+func P256ScalarRoundTripForTest(v []byte) ([32]byte, bool) {
+	var s janosP256Scalar
+	if _, ok := s.SetBytesBE(v); !ok {
+		return [32]byte{}, false
+	}
+	return s.Bytes(), true
+}
+
 // P256FieldOneForTest returns the multiplicative identity as 32 bytes.
 func P256FieldOneForTest() [32]byte {
 	var e janosP256Element
