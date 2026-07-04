@@ -6,10 +6,8 @@
 
 // JanOS: binary self-attestation, Linux reader.
 //
-// Linux exposes the currently running executable via the
-// /proc/self/exe symlink; opening it yields a file descriptor over
-// the on-disk image.  We hand a null-terminated path buffer to the
-// two-pass streaming hasher in janos_selfhash.go.
+// Linux exposes the running executable via /proc/self/exe.  We open
+// it and hand the fd to janos_selfhash.go's mmap-based hasher.
 
 package runtime
 
@@ -18,13 +16,15 @@ var janosSelfExePathLinux = [...]byte{'/', 'p', 'r', 'o', 'c', '/', 's', 'e', 'l
 const janosLinuxORDONLY = 0
 
 func janosInitBinaryHash() {
-	digest, ok := janosHashExecutable(janosLinuxOpenExe)
+	fd := open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
+	if fd < 0 {
+		return
+	}
+	defer closefd(fd)
+
+	digest, ok := janosHashFD(fd)
 	if !ok {
 		return
 	}
 	janosStoreBinaryHash(digest)
-}
-
-func janosLinuxOpenExe() int32 {
-	return open(&janosSelfExePathLinux[0], janosLinuxORDONLY, 0)
 }
