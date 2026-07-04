@@ -22,6 +22,12 @@
 // encoding/base64, encoding/pem, encoding/asn1, plus crypto-free
 // helpers.  It never touches private key material — the KMS holds
 // the key, we pass the digest, KMS returns the signature.
+//
+// Key type: ECDSA P-256 (Cloud KMS algorithm "EC_SIGN_P256_SHA256").
+// The Diviner interface returns pubkeys and signatures in raw
+// runtime format (64-byte X||Y for pubkeys, 64-byte r||s for
+// signatures).  This backend unwraps the PKIX/DER wire encoding
+// Cloud KMS speaks into that raw form.
 package gcpkms
 
 import (
@@ -32,6 +38,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -60,30 +67,33 @@ type gcpDiviner struct {
 	resource string
 }
 
-func (d *gcpDiviner) PublicKey() ([32]byte, error) {
+func (d *gcpDiviner) PublicKey() ([64]byte, error) {
 	// GET /v1/{resource}/publicKey -> {"pem": "-----BEGIN PUBLIC KEY-----\n..."}
 	url := fmt.Sprintf("%s/v1/%s/publicKey", endpoint, d.resource)
 	body, err := d.do("GET", url, nil)
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("gcpkms PublicKey: %w", err)
+		return [64]byte{}, fmt.Errorf("gcpkms PublicKey: %w", err)
 	}
 	var resp struct {
 		PEM string `json:"pem"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return [32]byte{}, fmt.Errorf("gcpkms PublicKey: decode: %w", err)
+		return [64]byte{}, fmt.Errorf("gcpkms PublicKey: decode: %w", err)
 	}
-	return parseEd25519PubKeyPEM(resp.PEM)
+	return parseP256PubKeyPEM(resp.PEM)
 }
 
 func (d *gcpDiviner) Sign(digest [32]byte) ([64]byte, error) {
 	// POST /v1/{resource}:asymmetricSign
-	// Body: {"data": base64(digest)}
-	// Ed25519 keys in KMS take the raw message via the `data` field
-	// (RSA/ECDSA keys use `digest.sha256` etc; Ed25519 is different).
+	// Body: {"digest": {"sha256": base64(digest)}}
+	// For ECDSA P-256 keys, KMS wants the pre-computed SHA-256 digest
+	// in the digest.sha256 field.  (Ed25519 uses the raw `data` field
+	// instead, but we no longer support Ed25519.)
 	url := fmt.Sprintf("%s/v1/%s:asymmetricSign", endpoint, d.resource)
 	req := map[string]any{
-		"data": base64.StdEncoding.EncodeToString(digest[:]),
+		"digest": map[string]any{
+			"sha256": base64.StdEncoding.EncodeToString(digest[:]),
+		},
 	}
 	reqBody, err := json.Marshal(req)
 	if err != nil {
@@ -99,16 +109,13 @@ func (d *gcpDiviner) Sign(digest [32]byte) ([64]byte, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return [64]byte{}, fmt.Errorf("gcpkms Sign: decode: %w", err)
 	}
-	sigBytes, err := base64.StdEncoding.DecodeString(resp.Signature)
+	sigDER, err := base64.StdEncoding.DecodeString(resp.Signature)
 	if err != nil {
 		return [64]byte{}, fmt.Errorf("gcpkms Sign: signature not valid base64: %w", err)
 	}
-	if len(sigBytes) != 64 {
-		return [64]byte{}, fmt.Errorf("gcpkms Sign: signature is %d bytes, want 64", len(sigBytes))
-	}
-	var out [64]byte
-	copy(out[:], sigBytes)
-	return out, nil
+	// KMS returns ECDSA signatures DER-encoded as SEQUENCE { INTEGER r,
+	// INTEGER s }.  Unwrap to the runtime's expected r || s form.
+	return decodeECDSASignatureDER(sigDER)
 }
 
 // do makes an authenticated HTTP request against Cloud KMS.  method
@@ -148,35 +155,81 @@ func (d *gcpDiviner) do(method, url string, body []byte) ([]byte, error) {
 	return respBody, nil
 }
 
-// parseEd25519PubKeyPEM extracts the raw 32-byte Ed25519 public key
-// from a PKIX SubjectPublicKeyInfo PEM blob.  Cloud KMS returns
-// public keys in this exact format for Ed25519 keys.
-func parseEd25519PubKeyPEM(pemText string) ([32]byte, error) {
-	var out [32]byte
+// parseP256PubKeyPEM extracts the raw 64-byte P-256 public key
+// (uncompressed X||Y without the SEC1 0x04 prefix) from a PKIX
+// SubjectPublicKeyInfo PEM blob.  Cloud KMS returns EC public keys
+// in this exact format.
+func parseP256PubKeyPEM(pemText string) ([64]byte, error) {
+	var out [64]byte
 	block, _ := pem.Decode([]byte(pemText))
 	if block == nil {
 		return out, fmt.Errorf("gcpkms: pubkey PEM decode failed")
 	}
-	// SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+	// SubjectPublicKeyInfo ::= SEQUENCE {
+	//   algorithm AlgorithmIdentifier,
+	//   subjectPublicKey BIT STRING
+	// }
+	// AlgorithmIdentifier ::= SEQUENCE {
+	//   algorithm  OBJECT IDENTIFIER,           -- id-ecPublicKey (1.2.840.10045.2.1)
+	//   parameters OBJECT IDENTIFIER            -- named curve OID (P-256 = 1.2.840.10045.3.1.7)
+	// }
 	var spki struct {
 		Algorithm struct {
 			Algorithm asn1.ObjectIdentifier
+			Curve     asn1.ObjectIdentifier
 		}
 		SubjectPublicKey asn1.BitString
 	}
 	if _, err := asn1.Unmarshal(block.Bytes, &spki); err != nil {
 		return out, fmt.Errorf("gcpkms: pubkey ASN.1 decode: %w", err)
 	}
-	// Ed25519 OID is 1.3.101.112.
-	ed25519OID := asn1.ObjectIdentifier{1, 3, 101, 112}
-	if !spki.Algorithm.Algorithm.Equal(ed25519OID) {
-		return out, fmt.Errorf("gcpkms: pubkey algorithm is %v, want Ed25519 (1.3.101.112)", spki.Algorithm.Algorithm)
+	ecPublicKeyOID := asn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+	p256OID := asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7}
+	if !spki.Algorithm.Algorithm.Equal(ecPublicKeyOID) {
+		return out, fmt.Errorf("gcpkms: pubkey algorithm is %v, want id-ecPublicKey (1.2.840.10045.2.1)", spki.Algorithm.Algorithm)
 	}
+	if !spki.Algorithm.Curve.Equal(p256OID) {
+		return out, fmt.Errorf("gcpkms: pubkey curve is %v, want P-256 (1.2.840.10045.3.1.7)", spki.Algorithm.Curve)
+	}
+	// SEC1 uncompressed encoding: 0x04 || X || Y, 65 bytes total.
 	raw := spki.SubjectPublicKey.Bytes
-	if len(raw) != 32 {
-		return out, fmt.Errorf("gcpkms: Ed25519 pubkey is %d bytes, want 32", len(raw))
+	if len(raw) != 65 || raw[0] != 0x04 {
+		return out, fmt.Errorf("gcpkms: P-256 pubkey is %d bytes with tag %#x, want 65 with 0x04 uncompressed tag", len(raw), raw[0])
 	}
-	copy(out[:], raw)
+	copy(out[:], raw[1:])
+	return out, nil
+}
+
+// decodeECDSASignatureDER unwraps a DER-encoded ECDSA signature
+// (SEQUENCE { INTEGER r, INTEGER s }) into the runtime's expected
+// r || s form.  Each integer is left-padded to 32 bytes; leading
+// zero bytes DER requires on positive integers whose top bit would
+// otherwise be set are stripped.
+func decodeECDSASignatureDER(der []byte) ([64]byte, error) {
+	var out [64]byte
+	var sig struct {
+		R, S *big.Int
+	}
+	rest, err := asn1.Unmarshal(der, &sig)
+	if err != nil {
+		return out, fmt.Errorf("gcpkms Sign: DER decode: %w", err)
+	}
+	if len(rest) != 0 {
+		return out, fmt.Errorf("gcpkms Sign: %d trailing bytes after DER signature", len(rest))
+	}
+	if sig.R == nil || sig.S == nil {
+		return out, fmt.Errorf("gcpkms Sign: DER missing r or s")
+	}
+	if sig.R.Sign() <= 0 || sig.S.Sign() <= 0 {
+		return out, fmt.Errorf("gcpkms Sign: r and s must be positive")
+	}
+	rBytes := sig.R.Bytes()
+	sBytes := sig.S.Bytes()
+	if len(rBytes) > 32 || len(sBytes) > 32 {
+		return out, fmt.Errorf("gcpkms Sign: r/s exceed 32 bytes (%d/%d) — not a P-256 signature", len(rBytes), len(sBytes))
+	}
+	copy(out[32-len(rBytes):32], rBytes)
+	copy(out[64-len(sBytes):64], sBytes)
 	return out, nil
 }
 

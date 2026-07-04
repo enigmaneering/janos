@@ -36,7 +36,7 @@ import "runtime"
 // enforcement, no family line to inherit.
 func janosInheritParentKeysIntoOutput(ctxt *Link) {
 	guild, release := runtime.JanosParentKeys()
-	zero := [32]byte{}
+	zero := [64]byte{}
 	if guild == zero && release == zero {
 		return // bootstrap janos; nothing to inherit
 	}

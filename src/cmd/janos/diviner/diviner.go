@@ -37,27 +37,32 @@ import (
 	"sync"
 )
 
-// Diviner produces Ed25519 signatures over pre-hashed 32-byte digests.
-// Implementations are backed by a KMS in production; test code uses
-// an in-package mock that wraps internal/runtime/janos_ed25519's
-// test-only signer.
+// Diviner produces ECDSA P-256 signatures over pre-hashed 32-byte
+// SHA-256 digests.  Implementations are backed by an HSM-protected
+// KMS in production; test code uses an in-package mock that wraps
+// stdlib crypto/ecdsa driven from a deterministic seed.
 //
-// The 32-byte digest passed to Sign is typically SHA-256 of a JanOS
-// binary with its JANOSCRT slot region zeroed.  Ed25519 will
-// internally SHA-512 that 32-byte input as part of its signing
-// procedure, which is fine for our purposes — collision resistance
-// of the outer SHA-256 carries into Ed25519's internal hashing.
+// P-256 was chosen over Ed25519 because Google Cloud KMS does not
+// offer HSM-level protection for Ed25519 keys — the whole point of
+// the diviner subsystem is HSM-boundary signing, so an
+// HSM-supported curve is required.  Signatures are returned in the
+// wire format the runtime verifier expects: 64 bytes r || s, each
+// 32 bytes big-endian.  Backends that speak DER (Cloud KMS does)
+// unwrap the ASN.1 before returning.
 type Diviner interface {
-	// PublicKey returns the Ed25519 public key of the KMS-held signing
-	// key this diviner is authorized to invoke.  Consumers cross-check
-	// this against the value stored in the signet file to confirm the
-	// URL and the signet agree on which key is authoritative.
-	PublicKey() ([32]byte, error)
+	// PublicKey returns the ECDSA P-256 public key of the KMS-held
+	// signing key this diviner is authorized to invoke.  64 bytes,
+	// uncompressed X || Y (no SEC1 0x04 prefix).  Consumers cross-
+	// check this against the value stored in the signet file to
+	// confirm the URL and the signet agree on which key is
+	// authoritative.
+	PublicKey() ([64]byte, error)
 
-	// Sign produces a 64-byte Ed25519 signature over digest.  Errors
-	// surface KMS-level failures (auth, network, quota, revocation).
-	// Callers translate an error to a hard link failure — a JanOS
-	// binary that cannot be divined must not be produced.
+	// Sign produces a 64-byte ECDSA P-256 signature (r || s) over
+	// digest.  Errors surface KMS-level failures (auth, network,
+	// quota, revocation).  Callers translate an error to a hard
+	// link failure — a JanOS binary that cannot be divined must not
+	// be produced.
 	Sign(digest [32]byte) ([64]byte, error)
 }
 

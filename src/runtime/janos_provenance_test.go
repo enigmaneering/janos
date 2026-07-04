@@ -149,15 +149,15 @@ func TestSetJanosCertificatesForTest(t *testing.T) {
 
 	guild := runtime.Certificate{
 		Level:        0,
-		SignerPubKey: [32]byte{0x01, 0x02, 0x03},
+		SignerPubKey: [64]byte{0x01, 0x02, 0x03},
 	}
 	release := runtime.Certificate{
 		Level:        1,
-		SignerPubKey: [32]byte{0x11, 0x12, 0x13},
+		SignerPubKey: [64]byte{0x11, 0x12, 0x13},
 	}
 	user := runtime.Certificate{
 		Level:        2,
-		SignerPubKey: [32]byte{0x21, 0x22, 0x23},
+		SignerPubKey: [64]byte{0x21, 0x22, 0x23},
 	}
 	runtime.SetJanosCertificatesForTest(guild, release, &user)
 
@@ -208,8 +208,8 @@ func TestCertIDsInheritance(t *testing.T) {
 		runtime.SetCurrentProvenanceForTest(saved)
 	}()
 
-	guild := runtime.Certificate{SignerPubKey: [32]byte{0xaa}}
-	release := runtime.Certificate{SignerPubKey: [32]byte{0xbb}}
+	guild := runtime.Certificate{SignerPubKey: [64]byte{0xaa}}
+	release := runtime.Certificate{SignerPubKey: [64]byte{0xbb}}
 	runtime.SetJanosCertificatesForTest(guild, release, nil)
 	parent := runtime.CurrentProvenance()
 
@@ -332,24 +332,6 @@ func TestJanosVerifyCertSlotBootstrapSkips(t *testing.T) {
 	}
 }
 
-// TestJanosVerifyChainHookInstalled: install a hook, confirm it can
-// be read back via the setter mechanism (the setter is
-// SetJanosVerifyChainHookForTest, exposed only in test mode).
-func TestJanosVerifyChainHookInstalled(t *testing.T) {
-	called := false
-	runtime.SetJanosVerifyChainHookForTest(func(slot []byte, guildPK, releasePK [32]byte) bool {
-		called = true
-		return true
-	})
-	defer runtime.SetJanosVerifyChainHookForTest(nil)
-
-	// Sanity: the fact that we can install and then clear the hook
-	// without a panic proves the plumbing exists.  We don't call
-	// janosVerifyCertSlot from here (it's unexported); a full
-	// end-to-end test that actually invokes it lives in the
-	// divined-binary integration test (task #61).
-	_ = called
-}
 
 // sha256Fixture returns a fixed byte pattern derived from name.
 // It is not an actual SHA-256 — provenance-inheritance tests do not

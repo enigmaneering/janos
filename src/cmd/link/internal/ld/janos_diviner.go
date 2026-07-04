@@ -150,7 +150,7 @@ func janosDivinerPass(ctxt *Link, divinerURL string) {
 
 	// Also patch the runtime's expected Guild + Release public key
 	// vars so schedinit's verifier knows what to check the slot
-	// against.  These symbols are declared with [32]byte initializers
+	// against.  These symbols are declared with [64]byte initializers
 	// so they land in .data (file-backed) alongside the slot.
 	if err := patchRuntimeKey(ctxt, "runtime.janosExpectedGuildPubKey", cfg.GuildPubKey[:]); err != nil {
 		Errorf("janos-diviner: %v", err)
@@ -188,7 +188,7 @@ func patchRuntimeKeyIfPresent(ctxt *Link, symName string, value []byte) error {
 
 // patchRuntimeKey overwrites the bytes at the named runtime symbol
 // with value.  The symbol must be an initialized array of the same
-// length as value (32 bytes for a pubkey).
+// length as value (64 bytes for a P-256 pubkey).
 func patchRuntimeKey(ctxt *Link, symName string, value []byte) error {
 	ldr := ctxt.loader
 	s := ldr.Lookup(symName, 0)

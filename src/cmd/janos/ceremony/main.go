@@ -17,10 +17,18 @@
 //
 //	export JANOS_GCP_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
 //	go run cmd/janos/ceremony \
-//	  --root=gcpkms://projects/PROJECT/locations/LOC/keyRings/janos/cryptoKeys/root/cryptoKeyVersions/1 \
-//	  --release=gcpkms://projects/PROJECT/locations/LOC/keyRings/janos/cryptoKeys/ambrosia/cryptoKeyVersions/1 \
+//	  --root=gcpkms://projects/PROJECT/locations/LOC/keyRings/guild/cryptoKeys/root/cryptoKeyVersions/1 \
+//	  --release=gcpkms://projects/PROJECT/locations/LOC/keyRings/guild/cryptoKeys/ambrosia/cryptoKeyVersions/1 \
 //	  --epoch=1 \
 //	  > signet
+//
+// Signing algorithm: ECDSA P-256.  Google Cloud KMS does not support
+// HSM protection for Ed25519 keys, so JanOS's family keys live as
+// EC_SIGN_P256_SHA256 asymmetric-signing keys with HSM protection.
+// The parent_cert baked into every colonel is Guild's P-256 signature
+// (r || s) over the Release public key (SHA-256'd once so the
+// signature is over the 32-byte digest, matching what the runtime
+// verifier will compute).
 //
 // The ceremony is IRREVERSIBLE in the sense that the resulting
 // parent_cert IS the chain of trust for this family line.  Losing
@@ -38,15 +46,17 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"math/big"
 	"os"
 
 	"cmd/janos/diviner"
 	_ "cmd/janos/diviner/gcpkms" // registers "gcpkms" scheme
-
-	"internal/runtime/janos_ed25519"
 )
 
 func main() {
@@ -95,14 +105,15 @@ func main() {
 		fmt.Fprintln(os.Stderr)
 	}
 
-	// The critical ceremony step: root signs release's public key.
-	// Ed25519 signs the raw 32-byte input; the 64-byte signature is
-	// what every colonel of this release will present to its runtime
-	// as Release.ParentCert.
-	fmt.Fprintln(os.Stderr, "requesting root to sign release public key...")
-	parentCert, err := rootDiviner.Sign(releasePK)
+	// The critical ceremony step: root signs SHA-256(release_pubkey).
+	// The runtime verifier hashes the parent's pubkey the same way
+	// before calling ECDSA verify, so both sides agree on the message
+	// under the signature.
+	fmt.Fprintln(os.Stderr, "requesting root to sign SHA-256(release_pubkey)...")
+	digest := sha256.Sum256(releasePK[:])
+	parentCert, err := rootDiviner.Sign(digest)
 	if err != nil {
-		fatal("root signing release pubkey: %v", err)
+		fatal("root signing release pubkey digest: %v", err)
 	}
 
 	// Local sanity check: verify the signature against the root's
@@ -110,8 +121,8 @@ func main() {
 	// misconfiguration (wrong algorithm, wrong key version, cached
 	// stale pubkey) would show up here rather than during a downstream
 	// build when the toolchain refuses to accept the chain.
-	if !janos_ed25519.Verify(rootPK[:], releasePK[:], parentCert[:]) {
-		fatal("SANITY CHECK FAILED — root's signature over release_pubkey does not verify with root's own public key.  KMS misconfiguration?")
+	if !verifyLocal(rootPK, digest, parentCert) {
+		fatal("SANITY CHECK FAILED — root's signature over SHA-256(release_pubkey) does not verify with root's own public key.  KMS misconfiguration?")
 	}
 
 	// Emit the signet.
@@ -125,8 +136,8 @@ func main() {
 	fmt.Fprintln(out, "#")
 	fmt.Fprintln(out, "# Commit this file to source control.  All values are public — no")
 	fmt.Fprintln(out, "# secret material is embedded here.  The KMS URLs are references,")
-	fmt.Fprintln(out, "# and the parent_cert is a signature that anyone with the root")
-	fmt.Fprintln(out, "# public key can verify.")
+	fmt.Fprintln(out, "# and the parent_cert is an ECDSA P-256 signature that anyone with")
+	fmt.Fprintln(out, "# the root public key can verify.")
 	fmt.Fprintln(out)
 
 	fmt.Fprintf(out, "guild_pubkey        = %s\n", hex.EncodeToString(rootPK[:]))
@@ -139,6 +150,21 @@ func main() {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "release ceremony complete; signet emitted to stdout")
 	fmt.Fprintln(os.Stderr, "next step: redirect stdout to the repo-root `signet` file")
+}
+
+// verifyLocal wraps stdlib crypto/ecdsa to check that (r, s) is
+// a valid signature over digest under the P-256 pubkey X||Y.  The
+// ceremony runs in a stock-Go environment, so we can lean on stdlib
+// here rather than the runtime's pure-Go verifier.
+func verifyLocal(pubKey [64]byte, digest [32]byte, sig [64]byte) bool {
+	pub := &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     new(big.Int).SetBytes(pubKey[:32]),
+		Y:     new(big.Int).SetBytes(pubKey[32:]),
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	return ecdsa.Verify(pub, digest[:], r, s)
 }
 
 func fatal(format string, args ...any) {

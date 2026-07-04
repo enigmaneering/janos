@@ -28,11 +28,12 @@ import (
 
 // Config is the parsed contents of a signet file.
 type Config struct {
-	// GuildPubKey is the 32-byte Ed25519 public key of the
+	// GuildPubKey is the 64-byte ECDSA P-256 public key of the
 	// Enigmaneering Guild's non-revocable root, used by the runtime
-	// to verify every Guild-level signature.  Hex-encoded in the
-	// file; decoded on load.
-	GuildPubKey [32]byte
+	// to verify every Guild-level signature.  Uncompressed X || Y
+	// form (no SEC1 0x04 prefix), hex-encoded in the file; decoded
+	// on load.
+	GuildPubKey [64]byte
 
 	// GuildDiviner is the KMS URL of the Guild's root signing key.
 	// Only invoked during release-ceremony builds; regular builds
@@ -42,20 +43,20 @@ type Config struct {
 	// otherwise ignores it.
 	GuildDiviner string
 
-	// ReleasePubKey is the 32-byte Ed25519 public key of this
-	// release's signing keypair.
-	ReleasePubKey [32]byte
+	// ReleasePubKey is the 64-byte ECDSA P-256 public key of this
+	// release's signing keypair (uncompressed X || Y).
+	ReleasePubKey [64]byte
 
 	// ReleaseDiviner is the KMS URL for this release's signing key.
 	// cmd/link invokes it on every build.  Must be a non-file://
 	// scheme in production; presence of file:// causes a link error.
 	ReleaseDiviner string
 
-	// ReleaseParentCert is Guild's Ed25519 signature over
-	// ReleasePubKey — the chain-of-trust link that lets Release
-	// certificates validate against the Guild root.  Produced once
-	// during a release ceremony.  Embedded into the JANOSCRT slot's
-	// Release entry as parent_cert.
+	// ReleaseParentCert is the Guild's ECDSA P-256 signature over
+	// ReleasePubKey (r || s, 64 bytes) — the chain-of-trust link
+	// that lets Release certificates validate against the Guild
+	// root.  Produced once during a release ceremony.  Embedded
+	// into the JANOSCRT slot's Release entry as parent_cert.
 	ReleaseParentCert [64]byte
 
 	// ReleaseEpoch is the monotonic serial for this release's
@@ -98,13 +99,13 @@ func Parse(r io.Reader) (*Config, error) {
 		val := strings.TrimSpace(line[eq+1:])
 		switch key {
 		case "guild_pubkey":
-			if err := decodeHex32(val, &c.GuildPubKey); err != nil {
+			if err := decodeHex64(val, &c.GuildPubKey); err != nil {
 				return nil, fmt.Errorf("signet: line %d guild_pubkey: %w", lineno+1, err)
 			}
 		case "guild_diviner":
 			c.GuildDiviner = val
 		case "release_pubkey":
-			if err := decodeHex32(val, &c.ReleasePubKey); err != nil {
+			if err := decodeHex64(val, &c.ReleasePubKey); err != nil {
 				return nil, fmt.Errorf("signet: line %d release_pubkey: %w", lineno+1, err)
 			}
 		case "release_diviner":
@@ -143,10 +144,10 @@ func Parse(r io.Reader) (*Config, error) {
 // (non-release-ceremony) build needs.  Returns an error naming the
 // first missing or malformed piece; nil on success.
 func (c *Config) ValidateForBuild() error {
-	if c.GuildPubKey == ([32]byte{}) {
+	if c.GuildPubKey == ([64]byte{}) {
 		return errors.New("signet: guild_pubkey is empty; cannot bake a Guild root into the runtime")
 	}
-	if c.ReleasePubKey == ([32]byte{}) {
+	if c.ReleasePubKey == ([64]byte{}) {
 		return errors.New("signet: release_pubkey is empty; cannot bake a Release identity into the runtime")
 	}
 	if c.ReleaseDiviner == "" {
@@ -188,7 +189,7 @@ func validateDivinerScheme(url string) error {
 	}
 }
 
-func decodeHex32(s string, out *[32]byte) error {
+func decodeHex64(s string, out *[64]byte) error {
 	if s == "" {
 		return nil
 	}
@@ -196,8 +197,8 @@ func decodeHex32(s string, out *[32]byte) error {
 	if err != nil {
 		return err
 	}
-	if len(decoded) != 32 {
-		return fmt.Errorf("want 32 bytes, got %d", len(decoded))
+	if len(decoded) != 64 {
+		return fmt.Errorf("want 64 bytes, got %d", len(decoded))
 	}
 	copy(out[:], decoded)
 	return nil
