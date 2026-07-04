@@ -39,10 +39,7 @@
 
 package runtime
 
-import (
-	"internal/runtime/janos_hash"
-	"unsafe"
-)
+import "internal/runtime/janos_hash"
 
 // janosStoreBinaryHash finishes a per-platform self-hash run: given
 // the completed SHA-256 digest, it writes both the hash and Trust-
@@ -69,72 +66,6 @@ var janosGoBuildIDMarker = [16]byte{
 // to hash and stay at TrustNone / TrustSelfAttested → false — the
 // runtime just doesn't declare itself divined.
 const janosMaxBinarySize = 256 << 20
-
-// janosHashFD reads the whole file behind fd into a fresh mmap
-// mapping, canonicalises the bytes the same way cmd/internal/buildid
-// .FindAndHash does (with the JanOS-specific extra zeros for slot
-// and expected pubkeys), and returns SHA-256 of the result.
-//
-// Returns (digest, true) on success, ([32]byte{}, false) on any I/O
-// or mmap error — the caller leaves the provenance untouched in that
-// case.
-func janosHashFD(fd int32) ([32]byte, bool) {
-	// Reserve a large VA window via anonymous mmap.  runtime.mmap
-	// bypasses the Go allocator, so TestMemPprof does not see the
-	// mapping in its alloc profile.
-	buf, mapped := janosMmapAnon(janosMaxBinarySize)
-	if buf == nil {
-		return [32]byte{}, false
-	}
-	defer janosMunmap(buf, mapped)
-
-	// Read the entire file into the mmap region.  Stops at EOF or
-	// when the buffer is full.  A file bigger than janosMaxBinary-
-	// Size is unusual for a Go binary; we refuse to hash it.
-	total := 0
-	for total < mapped {
-		n := read(fd, unsafe.Pointer(&buf[total]), int32(mapped-total))
-		if n < 0 {
-			return [32]byte{}, false
-		}
-		if n == 0 {
-			break
-		}
-		total += int(n)
-	}
-	if total == 0 || total >= mapped {
-		return [32]byte{}, false
-	}
-	fileBytes := buf[:total]
-
-	// Compute the exclusion set inline and hash in one pass.
-	return janosHashCanonical(fileBytes), true
-}
-
-// janosMmapAnon allocates an anonymous mmap region of size bytes via
-// runtime.mmap.  Returns (nil, 0) on failure.  The region is a
-// []byte view over the underlying pages.
-func janosMmapAnon(size int) ([]byte, int) {
-	if size <= 0 {
-		return nil, 0
-	}
-	p, err := mmap(nil, uintptr(size),
-		_PROT_READ|_PROT_WRITE,
-		_MAP_ANON|_MAP_PRIVATE,
-		-1, 0)
-	if err != 0 {
-		return nil, 0
-	}
-	return unsafe.Slice((*byte)(p), size), size
-}
-
-// janosMunmap releases a mapping obtained via janosMmapAnon.
-func janosMunmap(buf []byte, size int) {
-	if len(buf) == 0 || size <= 0 {
-		return
-	}
-	munmap(unsafe.Pointer(&buf[0]), uintptr(size))
-}
 
 // janosHashCanonical computes the digest of buf with the JanOS
 // canonicalisation applied, using the current runtime's expected

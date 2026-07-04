@@ -8,17 +8,18 @@
 //
 // Windows exposes the running executable via the PE loader.  We call
 // GetModuleFileNameW(NULL, ...) to get the exe's on-disk path as a
-// UTF-16 string, then CreateFileW + ReadFile to stream the bytes
-// through SHA-256.  The runtime's unix-shaped open/read/closefd stubs
-// on Windows just throw, so we go direct to kernel32 via the standard
-// runtime stdcall / cgo_import_dynamic pattern.
+// UTF-16 string, then CreateFileW to open it and ReadFile to fill a
+// VirtualAlloc'd buffer.  Once the whole binary is in memory we hand
+// it to the same portable janosHashCanonical the unix path uses.
+//
+// VirtualAlloc plays the same role as the unix mmap(MAP_ANON): it
+// bypasses the Go allocator, so TestMemPprof does not see the multi-
+// MB mapping in its alloc profile.  _VirtualAlloc / _VirtualFree /
+// _CloseHandle are already imported by os_windows.go — reuse those.
 
 package runtime
 
-import (
-	"internal/runtime/janos_hash"
-	"unsafe"
-)
+import "unsafe"
 
 //go:cgo_import_dynamic runtime._GetModuleFileNameW GetModuleFileNameW%3 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateFileW CreateFileW%7 "kernel32.dll"
@@ -36,7 +37,8 @@ const (
 	janosWinFileShareRead       = 0x00000001
 	janosWinOpenExisting        = 3
 	janosWinFileAttributeNormal = 0x80
-	janosWinReadChunk           = 4096
+	janosWinReadChunk           = 1 << 20 // 1 MiB per ReadFile call
+	janosWinMemCommitReserve    = _MEM_COMMIT | _MEM_RESERVE
 )
 
 var janosWinInvalidHandleValue = ^uintptr(0)
@@ -60,27 +62,63 @@ func janosInitBinaryHash() {
 	if handle == janosWinInvalidHandleValue {
 		return
 	}
+	defer stdcall(_CloseHandle, handle)
 
-	var d janos_hash.SHA256
-	d.Reset()
-	var buf [janosWinReadChunk]byte
-	for {
+	buf, mapped := janosWinVirtualAlloc(janosMaxBinarySize)
+	if buf == nil {
+		return
+	}
+	defer janosWinVirtualFree(buf, mapped)
+
+	total := 0
+	for total < mapped {
 		var got uint32
+		want := mapped - total
+		if want > janosWinReadChunk {
+			want = janosWinReadChunk
+		}
 		ok := stdcall(_ReadFile,
 			handle,
-			uintptr(unsafe.Pointer(&buf[0])),
-			uintptr(len(buf)),
+			uintptr(unsafe.Pointer(&buf[total])),
+			uintptr(want),
 			uintptr(unsafe.Pointer(&got)),
 			0)
 		if ok == 0 {
-			stdcall(_CloseHandle, handle)
 			return
 		}
 		if got == 0 {
 			break
 		}
-		d.Write(buf[:got])
+		total += int(got)
 	}
-	stdcall(_CloseHandle, handle)
-	janosStoreBinaryHash(d.Sum())
+	if total == 0 || total >= mapped {
+		return
+	}
+
+	janosStoreBinaryHash(janosHashCanonical(buf[:total]))
+}
+
+// janosWinVirtualAlloc reserves+commits an anonymous VA region via
+// VirtualAlloc, mirroring the unix janosMmapAnon.  The returned []byte
+// is a view over the raw pages; it does NOT participate in Go's GC.
+// Free with janosWinVirtualFree.
+func janosWinVirtualAlloc(size int) ([]byte, int) {
+	if size <= 0 {
+		return nil, 0
+	}
+	p := stdcall(_VirtualAlloc, 0, uintptr(size), janosWinMemCommitReserve, _PAGE_READWRITE)
+	if p == 0 {
+		return nil, 0
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(p)), size), size
+}
+
+// janosWinVirtualFree releases a region obtained via janosWinVirtualAlloc.
+// MEM_RELEASE with size=0 is the Windows contract for the reservation
+// as a whole.
+func janosWinVirtualFree(buf []byte, size int) {
+	if len(buf) == 0 || size <= 0 {
+		return
+	}
+	stdcall(_VirtualFree, uintptr(unsafe.Pointer(&buf[0])), 0, _MEM_RELEASE)
 }
