@@ -179,15 +179,28 @@ func janosCanonicalHash(buf, guildKey, releaseKey []byte) [32]byte {
 	janosZeroAll(buf, guildKey)
 	janosZeroAll(buf, releaseKey)
 
-	// Step 3: Mach-O codesig + LC_UUID.
+	// Step 3: platform host build-ID / code signature excludes.
+	// Mach-O: LC_CODE_SIGNATURE data + LC_UUID payload.
+	// ELF:    .note.gnu.build-id note payload (post-header).
+	// Both bail cleanly on non-matching magics.
 	janosZeroMachoExcludes(buf)
+	janosZeroElfExcludes(buf)
 
-	// Step 4: Go build ID.
+	// Step 4: Go build ID.  Mach-O carries it inside the
+	// `\xff Go build ID: "..."\n \xff` marker in .text; ELF carries
+	// it as the descriptor payload of the .note.go.buildid section.
+	// Try both patterns and zero every occurrence of the extracted
+	// ID.
 	if idStart, idEnd, ok := janosFindBuildIDInBuf(buf); ok {
 		id := append([]byte(nil), buf[idStart:idEnd]...)
 		if len(id) > 0 {
 			janosZeroAll(buf, id)
 		}
+	} else if id, ok := janosFindElfGoBuildID(buf); ok && len(id) > 0 {
+		// Copy id out before zeroing (zeroAll mutates the source
+		// bytes if the pattern overlaps its own location).
+		idCopy := append([]byte(nil), id...)
+		janosZeroAll(buf, idCopy)
 	}
 
 	// Step 5: hash.
@@ -339,4 +352,136 @@ func janosZeroMachoExcludes(buf []byte) {
 		}
 		off += cmdsize
 	}
+}
+
+// janosZeroElfExcludes parses buf's ELF header (if present) and
+// zeros the payload of the .note.gnu.build-id section, skipping the
+// 16-byte note "GNU\x00" header — the same range cmd/internal/build
+// id.FindAndHash excludes.  Under -B gobuildid (default on Linux),
+// the GNU note is derived from the Go build ID, so including it in
+// the identity hash creates the same convergence problem the Mach-O
+// LC_UUID exclusion solves.
+//
+// Only ELF64 little-endian inputs are handled — Go binaries on
+// supported architectures (amd64, arm64, riscv64, ppc64le) all
+// match.  Non-ELF, ELF32, or big-endian inputs are silently ignored.
+func janosZeroElfExcludes(buf []byte) {
+	secOff, secSize, ok := janosFindElfSection(buf, ".note.gnu.build-id")
+	if !ok || secSize < 16 {
+		return
+	}
+	s := secOff + 16
+	e := secOff + secSize
+	if e > uint64(len(buf)) {
+		e = uint64(len(buf))
+	}
+	for k := s; k < e; k++ {
+		buf[k] = 0
+	}
+}
+
+// janosFindElfGoBuildID looks for the .note.go.buildid section and
+// returns a slice pointing to the ID bytes inside its descriptor.
+// Unlike Mach-O binaries, Linux/ELF Go binaries do not embed the
+// `\xff Go build ID: "..."` marker in .text — the ID lives only in
+// the ELF note section, formatted as:
+//
+//	  0: n_namesz (u32 LE) = 4    (len of "Go\x00\x00")
+//	  4: n_descsz (u32 LE) = len(buildID)
+//	  8: n_type   (u32 LE)         (Go's private tag value)
+//	 12: name     ("Go\x00\x00")   (4 bytes, aligned)
+//	 16: descriptor                (n_descsz bytes = the ID)
+//
+// Returns (idBytes, true) on success; (nil, false) if the section
+// isn't present or the note format doesn't parse.
+func janosFindElfGoBuildID(buf []byte) ([]byte, bool) {
+	secOff, secSize, ok := janosFindElfSection(buf, ".note.go.buildid")
+	if !ok || secSize < 16 {
+		return nil, false
+	}
+	if secOff+secSize > uint64(len(buf)) {
+		return nil, false
+	}
+	namesz := janosU32LE(buf[secOff:])
+	descsz := janosU32LE(buf[secOff+4:])
+	if namesz != 4 || descsz == 0 {
+		return nil, false
+	}
+	// Name lives at secOff+12 for 4 bytes; descriptor at secOff+16.
+	if secOff+16+uint64(descsz) > secOff+secSize {
+		return nil, false
+	}
+	return buf[secOff+16 : secOff+16+uint64(descsz)], true
+}
+
+// janosFindElfSection walks the ELF64 LE section header table and
+// returns the (file offset, size) of the section whose name matches
+// target.  Returns (_, _, false) on any parse failure or when the
+// section is absent.  Callers must not treat the returned range as
+// valid without a size check.
+func janosFindElfSection(buf []byte, target string) (uint64, uint64, bool) {
+	if len(buf) < 64 {
+		return 0, 0, false
+	}
+	// e_ident magic: 0x7F 'E' 'L' 'F'.
+	if buf[0] != 0x7F || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F' {
+		return 0, 0, false
+	}
+	// EI_CLASS: 2 = ELFCLASS64; EI_DATA: 1 = ELFDATA2LSB.
+	if buf[4] != 2 || buf[5] != 1 {
+		return 0, 0, false
+	}
+	shoff := janosU64LE(buf[40:])
+	shentsize := uint64(janosU16LE(buf[58:]))
+	shnum := uint64(janosU16LE(buf[60:]))
+	shstrndx := uint64(janosU16LE(buf[62:]))
+	if shentsize < 64 || shnum == 0 || shstrndx >= shnum {
+		return 0, 0, false
+	}
+	if shoff+shnum*shentsize > uint64(len(buf)) {
+		return 0, 0, false
+	}
+	strTabHdrOff := shoff + shstrndx*shentsize
+	strTabOff := janosU64LE(buf[strTabHdrOff+24:])
+	strTabSize := janosU64LE(buf[strTabHdrOff+32:])
+	if strTabOff+strTabSize > uint64(len(buf)) {
+		return 0, 0, false
+	}
+
+	for i := uint64(0); i < shnum; i++ {
+		hdrOff := shoff + i*shentsize
+		nameIdx := uint64(janosU32LE(buf[hdrOff:]))
+		if nameIdx >= strTabSize {
+			continue
+		}
+		nameStart := strTabOff + nameIdx
+		if nameStart+uint64(len(target))+1 > uint64(len(buf)) {
+			continue
+		}
+		match := true
+		for k := 0; k < len(target); k++ {
+			if buf[nameStart+uint64(k)] != target[k] {
+				match = false
+				break
+			}
+		}
+		if !match || buf[nameStart+uint64(len(target))] != 0 {
+			continue
+		}
+		return janosU64LE(buf[hdrOff+24:]), janosU64LE(buf[hdrOff+32:]), true
+	}
+	return 0, 0, false
+}
+
+// janosU16LE, janosU32LE, janosU64LE read little-endian unsigned
+// integers from the front of b.  Callers ensure b has enough bytes.
+func janosU16LE(b []byte) uint16 {
+	return uint16(b[0]) | uint16(b[1])<<8
+}
+func janosU32LE(b []byte) uint32 {
+	return uint32(b[0]) | uint32(b[1])<<8 | uint32(b[2])<<16 | uint32(b[3])<<24
+}
+func janosU64LE(b []byte) uint64 {
+	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 |
+		uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56
 }

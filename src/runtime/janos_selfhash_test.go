@@ -60,22 +60,47 @@ type selfHashFixture struct {
 	codesigOff  int
 	codesigSize int
 	uuidOff     int
+
+	// elfNoteOff / elfNoteSize describe the range the ELF exclusion
+	// path zeros: everything AFTER the 16-byte GNU note header in
+	// the .note.gnu.build-id section.  -1 / 0 means no ELF header
+	// was embedded.
+	elfNoteOff  int
+	elfNoteSize int
+
+	// elfGoBuildIDValue holds the buildID string embedded in the
+	// .note.go.buildid section (and also duplicated elsewhere in
+	// the buffer to exercise multi-occurrence zeroing).  nil if the
+	// fixture didn't request the ELF Go buildID branch.
+	elfGoBuildIDValue []byte
 }
 
 // buildFixture constructs a Mach-O-shaped byte buffer with the
 // features controlled by the opts.  It returns a description of
 // what was embedded so the test can compute the expected digest.
 type fixtureOpts struct {
-	machO            bool  // if false, skip the Mach-O header (produces a plain buffer)
+	machO            bool  // if true, prepend a Mach-O 64-bit header
+	elf              bool  // if true, prepend an ELF64 LE header (mutually exclusive with machO)
 	includeSlot      bool  // if true, embed a JANOSCRT slot
 	divinedSlot      bool  // if includeSlot: version 1 (divined) vs version 0 (undivined)
 	pubkeyReps       int   // number of times to embed each pubkey (0, 1, or 2)
 	includeBuildID   bool  // if true, embed a valid Go build ID marker
 	garbageBuildID   bool  // if true, embed a marker with bad suffix (should be ignored)
-	includeCodesig   bool  // if true, LC_CODE_SIGNATURE present, blob at end of buffer
-	includeUUID      bool  // if true, LC_UUID present
-	bufSize          int   // total buffer size
+	includeCodesig      bool  // Mach-O only: if true, LC_CODE_SIGNATURE present, blob at end
+	includeUUID         bool  // Mach-O only: if true, LC_UUID present
+	includeElfNote      bool  // ELF only: if true, .note.gnu.build-id section present
+	includeElfGoBuildID bool  // ELF only: if true, .note.go.buildid section present + ID string embedded elsewhere in buf
+	bufSize             int   // total buffer size
 }
+
+// selfHashFixture also tracks the ELF host-buildID note range when
+// the fixture is ELF-shaped.  These fields are separate from the
+// Mach-O codesigOff / uuidOff so an ELF fixture doesn't accidentally
+// share expectation slots with a Mach-O one.
+//
+// (elfBuildIDOff, elfBuildIDLen) is the byte range zeroed by the
+// runtime's ELF exclusion path (skipping the 16-byte GNU note
+// header).
 
 func buildFixture(opts fixtureOpts) selfHashFixture {
 	if opts.bufSize == 0 {
@@ -87,6 +112,7 @@ func buildFixture(opts fixtureOpts) selfHashFixture {
 		buildIDOff: -1,
 		codesigOff: -1,
 		uuidOff:    -1,
+		elfNoteOff: -1,
 	}
 	// Fill with a distinctive pattern so a stray un-zeroed byte
 	// isn't a zero coincidence.
@@ -130,13 +156,120 @@ func buildFixture(opts fixtureOpts) selfHashFixture {
 		writeUint32LE(f.buf[8:], 0)
 		writeUint32LE(f.buf[12:], 2)
 		// ncmds + sizeofcmds are filled in after we know them; skip.
-	} else {
-		// Non-Mach-O input: put arbitrary bytes at the start.  The
-		// Mach-O parser must decline to touch anything.
+	} else if opts.elf {
+		// Minimal ELF64 little-endian header + a small section table.
+		// Sections we care about:
+		//   [0] SHT_NULL
+		//   [1] .shstrtab
+		//   [2] .note.gnu.build-id  (if includeElfNote)
+		//   [3] .note.go.buildid    (if includeElfGoBuildID)
+		//
+		// Layout in the buffer:
+		//	   0..64     ELF header
+		//	  64..320    section header table (4 × 64-byte entries)
+		//	 320..416    .shstrtab data (up to 48 bytes; pad reserved)
+		//	 416..464    .note.gnu.build-id (16+32 = 48 bytes)
+		//	 464..512    .note.go.buildid (16-byte hdr + name "Go\0\0"
+		//	            + 16-byte ID = 32 bytes)
 		f.buf[0] = 0x7F
 		f.buf[1] = 'E'
 		f.buf[2] = 'L'
 		f.buf[3] = 'F'
+		f.buf[4] = 2 // ELFCLASS64
+		f.buf[5] = 1 // ELFDATA2LSB
+		f.buf[6] = 1 // EV_CURRENT
+		writeUint16LE(f.buf[16:], 2)    // e_type = ET_EXEC
+		writeUint16LE(f.buf[18:], 0xB7) // e_machine = EM_AARCH64
+		writeUint32LE(f.buf[20:], 1)    // e_version
+
+		var shnum uint16 = 2 // NULL + shstrtab
+		if opts.includeElfNote {
+			shnum++
+		}
+		if opts.includeElfGoBuildID {
+			shnum++
+		}
+		const shentsize = 64
+		shoff := uint64(64)
+		writeUint64LE(f.buf[40:], shoff)
+		writeUint16LE(f.buf[58:], shentsize)
+		writeUint16LE(f.buf[60:], shnum)
+		writeUint16LE(f.buf[62:], 1) // e_shstrndx = 1 (.shstrtab)
+
+		// .shstrtab data at offset 320.  Layout:
+		//    0: \0
+		//    1: ".shstrtab\0"                       -> starts at 1
+		//   11: ".note.gnu.build-id\0"              -> starts at 11
+		//   30: ".note.go.buildid\0"                -> starts at 30
+		shstrtabOff := uint64(320)
+		f.buf[shstrtabOff+0] = 0
+		copy(f.buf[shstrtabOff+1:], ".shstrtab")
+		f.buf[shstrtabOff+1+9] = 0
+		copy(f.buf[shstrtabOff+11:], ".note.gnu.build-id")
+		f.buf[shstrtabOff+11+18] = 0
+		copy(f.buf[shstrtabOff+30:], ".note.go.buildid")
+		f.buf[shstrtabOff+30+16] = 0
+		shstrtabSize := uint64(47)
+
+		// Section header [1]: .shstrtab
+		hdr1 := shoff + 1*shentsize
+		writeUint32LE(f.buf[hdr1:], 1)                // sh_name = 1
+		writeUint32LE(f.buf[hdr1+4:], 3)              // SHT_STRTAB
+		writeUint64LE(f.buf[hdr1+24:], shstrtabOff)   // sh_offset
+		writeUint64LE(f.buf[hdr1+32:], shstrtabSize)  // sh_size
+
+		nextHdrIdx := uint64(2)
+		if opts.includeElfNote {
+			hdr := shoff + nextHdrIdx*shentsize
+			noteOff := uint64(416)
+			writeUint32LE(f.buf[noteOff:], 4)    // n_namesz
+			writeUint32LE(f.buf[noteOff+4:], 32) // n_descsz
+			writeUint32LE(f.buf[noteOff+8:], 3)  // NT_GNU_BUILD_ID
+			f.buf[noteOff+12] = 'G'
+			f.buf[noteOff+13] = 'N'
+			f.buf[noteOff+14] = 'U'
+			f.buf[noteOff+15] = 0
+			for i := uint64(0); i < 32; i++ {
+				f.buf[noteOff+16+i] = 0x77
+			}
+			writeUint32LE(f.buf[hdr:], 11)          // sh_name = 11 (".note.gnu.build-id")
+			writeUint32LE(f.buf[hdr+4:], 7)         // SHT_NOTE
+			writeUint64LE(f.buf[hdr+24:], noteOff)
+			writeUint64LE(f.buf[hdr+32:], 48)       // 16-byte hdr + 32 descriptor
+			f.elfNoteOff = int(noteOff + 16)
+			f.elfNoteSize = 32
+			nextHdrIdx++
+		}
+
+		if opts.includeElfGoBuildID {
+			hdr := shoff + nextHdrIdx*shentsize
+			goNoteOff := uint64(464)
+			// n_namesz = 4 ("Go\0\0"), n_descsz = 16 (small ID for
+			// the fixture), n_type = arbitrary (Go uses 4).
+			writeUint32LE(f.buf[goNoteOff:], 4)
+			writeUint32LE(f.buf[goNoteOff+4:], 16)
+			writeUint32LE(f.buf[goNoteOff+8:], 4)
+			f.buf[goNoteOff+12] = 'G'
+			f.buf[goNoteOff+13] = 'o'
+			f.buf[goNoteOff+14] = 0
+			f.buf[goNoteOff+15] = 0
+			// A distinctive 16-byte Go build ID value.
+			f.elfGoBuildIDValue = []byte("goBUILDidTEST_1x")
+			copy(f.buf[goNoteOff+16:], f.elfGoBuildIDValue)
+			writeUint32LE(f.buf[hdr:], 30)           // sh_name = 30 (".note.go.buildid")
+			writeUint32LE(f.buf[hdr+4:], 7)          // SHT_NOTE
+			writeUint64LE(f.buf[hdr+24:], goNoteOff)
+			writeUint64LE(f.buf[hdr+32:], 32)        // 16 hdr + 16 descriptor
+			nextHdrIdx++
+		}
+		loadOff = 512
+	} else {
+		// Non-Mach-O, non-ELF input: put arbitrary bytes at the
+		// start.  Both parsers must decline to touch anything.
+		f.buf[0] = 0x7F
+		f.buf[1] = 'X' // deliberately not 'E'
+		f.buf[2] = 'Y'
+		f.buf[3] = 'Z'
 	}
 
 	if opts.machO && opts.includeUUID {
@@ -200,6 +333,16 @@ func buildFixture(opts fixtureOpts) selfHashFixture {
 			off += 128
 		}
 		contentStart = off + 64
+	}
+
+	// If the ELF fixture has a Go build ID, embed one extra copy of
+	// its value at a content position so the runtime's find-and-zero
+	// path is exercised at more than just the note descriptor.  The
+	// note-descriptor copy is zeroed too (the ID pattern is unique
+	// and its bytes appear everywhere they were placed).
+	if len(f.elfGoBuildIDValue) > 0 {
+		copy(f.buf[contentStart:], f.elfGoBuildIDValue)
+		contentStart += len(f.elfGoBuildIDValue) + 32
 	}
 
 	if opts.includeBuildID || opts.garbageBuildID {
@@ -299,22 +442,63 @@ func expectedDigest(f selfHashFixture) [32]byte {
 			buf[i] = 0
 		}
 	}
-
-	// Step 4: Go build ID (every occurrence of the ID string).
-	if f.buildIDOff >= 0 {
-		// The ID lives at f.buildIDOff + 16 .. + 16 + len(id).  In
-		// the fixture it appears exactly once at that position.
-		// The runtime searches for any occurrence of the ID string,
-		// so this test computation should mirror that — but our
-		// fixture only puts the ID at one place, so a single zero
-		// is correct.
-		start := f.buildIDOff + 16
-		for j := 0; j < len(f.buildIDID); j++ {
-			buf[start+j] = 0
+	if f.elfNoteOff >= 0 {
+		for i := f.elfNoteOff; i < f.elfNoteOff+f.elfNoteSize; i++ {
+			buf[i] = 0
 		}
 	}
 
+	// Step 4: Go build ID (every occurrence of the ID string).
+	// On Mach-O fixtures the runtime finds the ID via the
+	// `\xff Go build ID: "..."\n \xff` marker; on ELF fixtures via
+	// the .note.go.buildid descriptor.  Either way, the algorithm
+	// zeros EVERY occurrence of the ID bytes in the buffer.  Our
+	// fixtures embed the Mach-O ID once (inside the marker) and the
+	// ELF ID at two positions (the note descriptor and one extra
+	// stamp elsewhere in content).
+	if f.buildIDOff >= 0 {
+		zeroAllInBuf(buf, f.buildIDID)
+	}
+	if len(f.elfGoBuildIDValue) > 0 {
+		zeroAllInBuf(buf, f.elfGoBuildIDValue)
+	}
+
 	return runtime.JanosSHA256ForTest(buf)
+}
+
+// zeroAllInBuf is a test-side copy of the runtime's zeroAll: zeros
+// every non-overlapping occurrence of pattern in buf.
+func zeroAllInBuf(buf, pattern []byte) {
+	n := len(pattern)
+	if n == 0 || n > len(buf) {
+		return
+	}
+	first := pattern[0]
+	limit := len(buf) - n
+	for i := 0; i <= limit; i++ {
+		if buf[i] != first {
+			continue
+		}
+		match := true
+		for j := 1; j < n; j++ {
+			if buf[i+j] != pattern[j] {
+				match = false
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		for j := 0; j < n; j++ {
+			buf[i+j] = 0
+		}
+		i += n - 1
+	}
+}
+
+func writeUint16LE(dst []byte, v uint16) {
+	dst[0] = byte(v)
+	dst[1] = byte(v >> 8)
 }
 
 func writeUint32LE(dst []byte, v uint32) {
@@ -322,6 +506,17 @@ func writeUint32LE(dst []byte, v uint32) {
 	dst[1] = byte(v >> 8)
 	dst[2] = byte(v >> 16)
 	dst[3] = byte(v >> 24)
+}
+
+func writeUint64LE(dst []byte, v uint64) {
+	dst[0] = byte(v)
+	dst[1] = byte(v >> 8)
+	dst[2] = byte(v >> 16)
+	dst[3] = byte(v >> 24)
+	dst[4] = byte(v >> 32)
+	dst[5] = byte(v >> 40)
+	dst[6] = byte(v >> 48)
+	dst[7] = byte(v >> 56)
 }
 
 // TestJanosCanonicalHashDivinedHappy: fully-divined Mach-O fixture
@@ -403,20 +598,80 @@ func TestJanosCanonicalHashGarbageBuildIDMarker(t *testing.T) {
 	}
 }
 
-// TestJanosCanonicalHashNonMachO: fixture with an ELF-like magic
-// instead of Mach-O.  The Mach-O parser must decline — no LC_CODE_
-// SIGNATURE or LC_UUID zeroing — and the rest of the algorithm
-// (slot / pubkeys / build ID) still runs.
-func TestJanosCanonicalHashNonMachO(t *testing.T) {
+// TestJanosCanonicalHashNonMachONonELF: fixture with a random magic
+// that's neither Mach-O nor ELF.  Both parsers must decline; the
+// rest of the algorithm (slot / pubkeys / build ID) still runs.
+func TestJanosCanonicalHashNonMachONonELF(t *testing.T) {
 	f := buildFixture(fixtureOpts{
-		machO:          false,
 		includeSlot:    true,
 		divinedSlot:    true,
 		pubkeyReps:     1,
 		includeBuildID: true,
 	})
-	// No Mach-O header, so buildFixture skipped both LC_UUID and
-	// LC_CODE_SIGNATURE — codesigOff and uuidOff are already -1.
+	// No Mach-O / ELF header, so buildFixture left codesig/uuid/
+	// elfNote fields at their -1 sentinels.
+	want := expectedDigest(f)
+	got := runtime.JanosCanonicalHashForTest(f.buf, f.guildPat[:], f.releasePat[:])
+	if got != want {
+		t.Errorf("hash mismatch\n want %x\n got  %x", want, got)
+	}
+}
+
+// TestJanosCanonicalHashElfDivinedHappy: ELF64 fixture with a
+// .note.gnu.build-id section, valid slot, pubkey embeds, build-ID
+// marker.  All the same regions as Mach-O plus the note-payload
+// range must be zeroed.
+func TestJanosCanonicalHashElfDivinedHappy(t *testing.T) {
+	f := buildFixture(fixtureOpts{
+		elf:            true,
+		includeElfNote: true,
+		includeSlot:    true,
+		divinedSlot:    true,
+		pubkeyReps:     1,
+		includeBuildID: true,
+	})
+	want := expectedDigest(f)
+	got := runtime.JanosCanonicalHashForTest(f.buf, f.guildPat[:], f.releasePat[:])
+	if got != want {
+		t.Errorf("hash mismatch\n want %x\n got  %x", want, got)
+	}
+}
+
+// TestJanosCanonicalHashElfWithoutNote: ELF64 fixture whose section
+// table does NOT include a .note.gnu.build-id section.  The runtime
+// must find nothing to zero and produce a digest that matches the
+// same fixture with no ELF exclusion applied.
+func TestJanosCanonicalHashElfWithoutNote(t *testing.T) {
+	f := buildFixture(fixtureOpts{
+		elf:            true,
+		includeElfNote: false, // no note section — nothing to zero
+		includeSlot:    true,
+		divinedSlot:    true,
+		pubkeyReps:     1,
+		includeBuildID: true,
+	})
+	want := expectedDigest(f)
+	got := runtime.JanosCanonicalHashForTest(f.buf, f.guildPat[:], f.releasePat[:])
+	if got != want {
+		t.Errorf("hash mismatch\n want %x\n got  %x", want, got)
+	}
+}
+
+// TestJanosCanonicalHashElfGoBuildID: ELF64 fixture with a
+// .note.go.buildid section carrying a distinctive ID plus one extra
+// stamp of that ID somewhere else in the buffer.  The runtime must
+// extract the ID from the note descriptor and zero every occurrence
+// — both the note descriptor and the extra stamp.  This is the code
+// path Linux divined boots depend on.
+func TestJanosCanonicalHashElfGoBuildID(t *testing.T) {
+	f := buildFixture(fixtureOpts{
+		elf:                 true,
+		includeElfNote:      true, // .note.gnu.build-id present
+		includeElfGoBuildID: true, // .note.go.buildid present + one extra stamp
+		includeSlot:         true,
+		divinedSlot:         true,
+		pubkeyReps:          1,
+	})
 	want := expectedDigest(f)
 	got := runtime.JanosCanonicalHashForTest(f.buf, f.guildPat[:], f.releasePat[:])
 	if got != want {
