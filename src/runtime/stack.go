@@ -471,9 +471,17 @@ func stackfree(stk stack) {
 	if stk.lo+n < stk.hi {
 		throw("bad stack size")
 	}
+	// JanOS: zero the whole stack range before it goes to any reuse
+	// pool.  Covers both the small-stack stackpool/stackcache path
+	// (line ~502) and the large-stack stackLarge / freeManual path
+	// (line ~534) with a single hook.  Stack pages hold function
+	// arguments, local variables, spilled registers, and (very
+	// commonly) crypto ephemerals; without this the next goroutine
+	// to grab this stack range from the pool would see the previous
+	// goroutine's plaintext.
+	janosSanitizeStack(v, n)
 	if stackDebug >= 1 {
 		println("stackfree", v, n)
-		memclrNoHeapPointers(v, n) // for testing, clobber stack data
 	}
 	if debug.efence != 0 || stackFromSystem != 0 {
 		if debug.efence != 0 || stackFaultOnFree != 0 {

@@ -615,7 +615,10 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		spanHasNoSpecials(s)
 	}
 
-	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {
+	// JanOS: sanitize freed slots unconditionally, and let stock Go's
+	// debug/trace/race/msan/asan callbacks piggy-back off the same
+	// iteration so we don't walk the mark bitmap twice.
+	{
 		// Find all newly freed objects.
 		mbits := s.markBitsForBase()
 		abits := s.allocBitsForIndex(0)
@@ -644,6 +647,13 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				}
 				if valgrindenabled && !s.isUserArenaChunk {
 					valgrindFree(unsafe.Pointer(x))
+				}
+				// JanOS zero-on-sweep: also on arena chunks (arena
+				// slots hold user data too).  Runs after the debug
+				// callbacks in case a debug hook wanted to inspect
+				// the pre-zero bytes.
+				if !s.isUserArenaChunk {
+					memclrNoHeapPointers(unsafe.Pointer(x), size)
 				}
 			}
 			mbits.advance()
@@ -831,6 +841,12 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				s.limit = 0 // prevent mlookup from finding this span
 				sysFault(unsafe.Pointer(s.base()), size)
 			} else {
+				// JanOS: zero the full page range before handing pages
+				// back to the heap.  A large object's tail padding could
+				// otherwise linger in RAM until the pages are scavenged
+				// (madvise(MADV_DONTNEED)) or reused via a needzero
+				// allocation — an unbounded window.
+				janosSanitizeLargeSpan(s)
 				mheap_.freeSpan(s)
 			}
 			return true
