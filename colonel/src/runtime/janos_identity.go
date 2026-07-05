@@ -32,7 +32,11 @@
 
 package runtime
 
-import "internal/runtime/janos_hash"
+import (
+	"internal/runtime/atomic"
+	"internal/runtime/janos_hash"
+	"unsafe"
+)
 
 // janosRootKey backs all per-goroutine identity derivation for this
 // process.  Populated once at schedinit with 32 random bytes; never
@@ -124,6 +128,10 @@ func (id Identity) Derive(other ...byte) ([]byte, error) {
 // authorizes the caller by comparing their current
 // provenance.identity to the block, so any goroutine that inherits
 // the block via the normal newproc1 copy is a valid caller.
+//
+// Attaches a finalizer so packages that keyed cleanup state on this
+// block (e.g. sync.Idempotent) can be notified when the block
+// becomes GC-unreachable.
 func janosMintIdentity(parentInstanceID [16]byte) *identityBlock {
 	var idx uint64
 	{
@@ -132,12 +140,78 @@ func janosMintIdentity(parentInstanceID [16]byte) *identityBlock {
 		idx = uint64(hi)<<32 | uint64(lo)
 	}
 	priv, pub := janosDeriveIdentityKey(idx)
-	return &identityBlock{
+	b := &identityBlock{
 		parentInstanceID: parentInstanceID,
 		index:            idx,
 		privateKey:       priv,
 		publicPoint:      pub,
 	}
+	// SetFinalizer is unsafe to call during runtime.schedinit (before
+	// the finalizer subsystem is up).  Attach the finalizer only if
+	// the runtime has completed the pre-main init sequence.
+	if janosFinalizersReady.Load() {
+		SetFinalizer(b, janosBlockFinalized)
+	} else {
+		// The main goroutine's block is created at schedinit; queue it
+		// for later finalizer attachment.  A single block deferred is
+		// enough: schedinit only mints one before finalizers are up.
+		janosDeferredFinalizerBlock = b
+	}
+	return b
+}
+
+// janosFinalizersReady flips true from runtime.main once the finalizer
+// goroutine and package inits are safe to reach.  See
+// janosLateFinalizerInit below.
+var janosFinalizersReady janosAtomicBool
+
+// janosDeferredFinalizerBlock holds the single identityBlock minted
+// before finalizers are ready (the main goroutine's).  Attached later
+// by janosLateFinalizerInit.
+var janosDeferredFinalizerBlock *identityBlock
+
+// janosAtomicBool is a tiny local atomic bool to avoid pulling in
+// sync/atomic (which would break the runtime's import graph).
+type janosAtomicBool struct{ v uint32 }
+
+//go:nosplit
+func (b *janosAtomicBool) Load() bool { return atomic.Load(&b.v) != 0 }
+
+//go:nosplit
+func (b *janosAtomicBool) Store(v bool) {
+	if v {
+		atomic.Store(&b.v, 1)
+	} else {
+		atomic.Store(&b.v, 0)
+	}
+}
+
+// janosLateFinalizerInit is called from runtime.main just before user
+// main runs.  Attaches the deferred finalizer to the main goroutine's
+// identityBlock and flips janosFinalizersReady so subsequent Fork
+// calls attach synchronously.
+func janosLateFinalizerInit() {
+	if janosDeferredFinalizerBlock != nil {
+		SetFinalizer(janosDeferredFinalizerBlock, janosBlockFinalized)
+		janosDeferredFinalizerBlock = nil
+	}
+	janosFinalizersReady.Store(true)
+}
+
+// janosFreshInstanceID draws 16 random bytes to form a new
+// InstanceID.  Used by Fork so the child is distinguishable at the
+// InstanceID level in addition to having a distinct identityBlock.
+//
+//go:nosplit
+func janosFreshInstanceID() [16]byte {
+	var iid [16]byte
+	hi := rand()
+	lo := rand()
+	for i := 0; i < 8; i++ {
+		iid[i] = byte(hi >> (i * 8))
+		iid[i+8] = byte(lo >> (i * 8))
+	}
+	return iid
 }
 
 // janosDeriveIdentityKey deterministically derives a P-256 private
@@ -323,22 +397,82 @@ func Identify() Identity {
 // fresh InstanceID is also assigned to the child so the fork is
 // distinguishable at that level too.
 //
+// Path B: the identityBlock and the fresh InstanceID are minted in
+// the PARENT goroutine before the go spawn.  The child's very first
+// instructions install the pre-minted identity into its provenance;
+// no user code runs on the child with the inherited-then-replaced
+// identity in scope.
+//
 // A future `fork` keyword lowers to this function.  Distinct from
 // `go`: `go`-spawned goroutines share the parent's identityBlock
 // (equal Identity by ==); Fork-spawned goroutines mint their own.
 func Fork(f func()) {
 	parentInstanceID := getg().provenance.instanceID
+	newBlock := janosMintIdentity(parentInstanceID)
+	freshIID := janosFreshInstanceID()
 	go func() {
 		gp := getg()
-		gp.provenance.identity = janosMintIdentity(parentInstanceID)
-		hi := rand()
-		lo := rand()
-		for i := 0; i < 8; i++ {
-			gp.provenance.instanceID[i] = byte(hi >> (i * 8))
-			gp.provenance.instanceID[i+8] = byte(lo >> (i * 8))
-		}
+		gp.provenance.identity = newBlock
+		gp.provenance.instanceID = freshIID
 		f()
 	}()
+}
+
+// janosBlockFinalizedHooks is the list of callbacks registered by
+// packages that key cleanup state on identityBlock addresses.  The
+// hook is invoked from the finalizer goroutine when a block becomes
+// GC-unreachable; each hook receives the block's address as a
+// uintptr, which cannot be dereferenced to reach the private key.
+var janosBlockFinalizedHooks struct {
+	mu  mutex
+	fns []func(uintptr)
+}
+
+// janosBlockFinalized is the finalizer attached to every
+// identityBlock at mint time.  Runs on the finalizer goroutine when
+// the block becomes GC-unreachable — i.e. when no live goroutine
+// still has this block in its gProvenance.identity.
+func janosBlockFinalized(b *identityBlock) {
+	addr := uintptr(unsafe.Pointer(b))
+	lock(&janosBlockFinalizedHooks.mu)
+	// Snapshot under the lock; invoke outside to avoid lock inversion
+	// with any hook that takes its own locks.
+	fns := make([]func(uintptr), len(janosBlockFinalizedHooks.fns))
+	copy(fns, janosBlockFinalizedHooks.fns)
+	unlock(&janosBlockFinalizedHooks.mu)
+	for _, fn := range fns {
+		fn(addr)
+	}
+}
+
+// janosRegisterBlockFinalizedHook is reached from sync (and any
+// future package that wants block-lifecycle notifications) via
+// //go:linkname.  Deliberately unexported: user code has no way to
+// register hooks that would learn block addresses.
+//
+// Do not change signature: used via linkname from sync.
+//
+//go:nosplit
+//go:linkname janosRegisterBlockFinalizedHook
+func janosRegisterBlockFinalizedHook(fn func(uintptr)) {
+	lock(&janosBlockFinalizedHooks.mu)
+	janosBlockFinalizedHooks.fns = append(janosBlockFinalizedHooks.fns, fn)
+	unlock(&janosBlockFinalizedHooks.mu)
+}
+
+// janosIdentityBlockAddr returns the identityBlock address for id as
+// a uintptr.  Reached from sync via //go:linkname.  Deliberately
+// unexported: user code has no way to extract the address from an
+// Identity value.  The uintptr is a lifecycle key, not a pointer —
+// it cannot be dereferenced without knowing the identityBlock struct
+// layout (which is unexported).
+//
+// Do not change signature: used via linkname from sync.
+//
+//go:nosplit
+//go:linkname janosIdentityBlockAddr
+func janosIdentityBlockAddr(id Identity) uintptr {
+	return uintptr(unsafe.Pointer(id.block))
 }
 
 // Sentinel errors returned by Identity.Derive.

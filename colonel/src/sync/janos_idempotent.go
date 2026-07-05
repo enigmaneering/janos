@@ -12,13 +12,70 @@
 // want "once per THIS goroutine" pass runtime.Identify() explicitly;
 // callers who want "once per collection of peers" pass the
 // participants' Identity values.
+//
+// Cleanup: when an identity block dies (all goroutines referring to
+// it have been GC'd), any entries in any Idempotent whose collective
+// key involved that block are evicted.  This is driven by a runtime-
+// side finalizer: sync registers a hook at package init that runtime
+// calls when a block goes unreachable.  Idempotent instances hold
+// weak.Pointer registry entries so a locally-scoped Idempotent gets
+// GC'd normally when its user drops the reference.
 
 package sync
 
 import (
 	"runtime"
 	"unsafe"
+	"weak"
+	_ "unsafe" // for go:linkname
 )
+
+// runtimeRegisterBlockFinalizedHook lets sync be notified when any
+// identity block becomes GC-unreachable.  Reached via linkname because
+// runtime exposes it as an unexported package-level function.
+//
+//go:linkname runtimeRegisterBlockFinalizedHook runtime.janosRegisterBlockFinalizedHook
+func runtimeRegisterBlockFinalizedHook(fn func(blockAddr uintptr))
+
+// runtimeIdentityBlockAddr yields the block address behind an Identity
+// as a uintptr.  Reached via linkname; unexported in runtime so user
+// code cannot obtain it.  The uintptr is a lifecycle key, not a
+// dereference-able pointer to anything containing private-key material.
+//
+//go:linkname runtimeIdentityBlockAddr runtime.janosIdentityBlockAddr
+func runtimeIdentityBlockAddr(id runtime.Identity) uintptr
+
+// idempotentRegistry holds weak references to every Idempotent
+// instance that has been used at least once.  Block-finalized hooks
+// walk this list to evict entries; stale (nil-Value) weak refs are
+// swept on the same walk.
+var idempotentRegistry struct {
+	mu   Mutex
+	list []weak.Pointer[Idempotent]
+}
+
+func init() {
+	runtimeRegisterBlockFinalizedHook(idempotentOnBlockFinalized)
+}
+
+// idempotentOnBlockFinalized is called by the runtime finalizer
+// goroutine when any identity block becomes GC-unreachable.  Walks
+// the Idempotent registry, evicting entries that used this block and
+// dropping weak refs whose Idempotent has itself been GC'd.
+func idempotentOnBlockFinalized(blockAddr uintptr) {
+	idempotentRegistry.mu.Lock()
+	kept := idempotentRegistry.list[:0]
+	for _, wp := range idempotentRegistry.list {
+		idem := wp.Value()
+		if idem == nil {
+			continue // Idempotent was GC'd; drop the stale weak ref
+		}
+		kept = append(kept, wp)
+		idem.evictBlock(blockAddr)
+	}
+	idempotentRegistry.list = kept
+	idempotentRegistry.mu.Unlock()
+}
 
 // Idempotent runs a function exactly once per identity collective.
 //
@@ -30,8 +87,16 @@ import (
 //
 // The zero value is ready to use.  An Idempotent should not be copied
 // after first use.
+//
+// Automatic cleanup: when all goroutines holding an identity die and
+// the block is GC'd, entries keyed on that block are evicted.  A
+// truly-local Idempotent that itself becomes unreachable is likewise
+// GC'd — the registry holds only weak references.
 type Idempotent struct {
-	m Map // map[[80]byte]*Once — key is the XOR-fold of raw Identity bytes
+	mu           Mutex
+	entries      map[[80]byte]*Once   // collective key → Once slot
+	perBlockKeys map[uintptr][][80]byte // block addr → collective keys it participates in
+	registered   bool                 // has this Idempotent been added to the registry?
 }
 
 // Do runs f exactly once for the identity collective formed by
@@ -42,8 +107,59 @@ type Idempotent struct {
 // same guarantee sync.Once provides.
 func (i *Idempotent) Do(f func(), identities ...runtime.Identity) {
 	key := collectiveKey(identities)
-	entry, _ := i.m.LoadOrStore(key, &Once{})
-	entry.(*Once).Do(f)
+
+	i.mu.Lock()
+	if i.entries == nil {
+		i.entries = make(map[[80]byte]*Once)
+		i.perBlockKeys = make(map[uintptr][][80]byte)
+	}
+	if !i.registered {
+		i.registered = true
+		i.selfRegister()
+	}
+	entry, ok := i.entries[key]
+	if !ok {
+		entry = &Once{}
+		i.entries[key] = entry
+		// Associate this key with each contributing block so the
+		// finalizer hook can evict it when the block dies.
+		for _, id := range identities {
+			addr := runtimeIdentityBlockAddr(id)
+			if addr == 0 {
+				continue // empty Identity — no block to associate with
+			}
+			i.perBlockKeys[addr] = append(i.perBlockKeys[addr], key)
+		}
+	}
+	i.mu.Unlock()
+
+	entry.Do(f)
+}
+
+// selfRegister adds a weak pointer to this Idempotent to the global
+// registry.  Called at most once per Idempotent (first Do).  Held
+// under i.mu by the caller; takes idempotentRegistry.mu.
+func (i *Idempotent) selfRegister() {
+	wp := weak.Make(i)
+	idempotentRegistry.mu.Lock()
+	idempotentRegistry.list = append(idempotentRegistry.list, wp)
+	idempotentRegistry.mu.Unlock()
+}
+
+// evictBlock removes every collective-key entry that involved the
+// given block address.  Invoked by idempotentOnBlockFinalized from
+// the finalizer goroutine.
+func (i *Idempotent) evictBlock(addr uintptr) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	keys, ok := i.perBlockKeys[addr]
+	if !ok {
+		return
+	}
+	for _, key := range keys {
+		delete(i.entries, key)
+	}
+	delete(i.perBlockKeys, addr)
 }
 
 // collectiveKey folds a slice of Identity values into a single
@@ -56,12 +172,6 @@ func collectiveKey(ids []runtime.Identity) [80]byte {
 	if len(ids) == 0 {
 		return key
 	}
-	// Reinterpret each Identity as [80]byte for XOR-folding.  Identity
-	// on 64-bit is 8 (Index) + 64 (PublicPoint) + 8 (block pointer)
-	// = 80 bytes.  On 32-bit it's 76 bytes and Identity has different
-	// padding; the compile-time assertion below catches drift.
-	var _ [1]struct{}
-	_ = *(*[80]byte)(unsafe.Pointer(&ids[0]))
 	for _, id := range ids {
 		bits := *(*[80]byte)(unsafe.Pointer(&id))
 		for j := range key {

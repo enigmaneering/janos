@@ -288,7 +288,8 @@ func main() {
 		}
 		return
 	}
-	fn := main_main // make an indirect call, as the linker doesn't know the address of the main package when laying down the runtime
+	janosLateFinalizerInit() // JanOS: attach finalizer to the main goroutine's identityBlock and open the door for Fork's synchronous SetFinalizer
+	fn := main_main          // make an indirect call, as the linker doesn't know the address of the main package when laying down the runtime
 	fn()
 
 	// Check for C memory leaks if using ASAN and we've made cgo calls,
