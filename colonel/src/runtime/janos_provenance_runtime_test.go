@@ -291,3 +291,66 @@ func certIDForTest(pk [64]byte) [32]byte {
 func JanosCanonicalHashForTest(buf, guildKey, releaseKey []byte) [32]byte {
 	return janosCanonicalHash(buf, guildKey, releaseKey)
 }
+
+// JanosHMACSHA256ForTest exposes the runtime's HMAC-SHA256 to
+// external tests for validation against RFC 4231 vectors.
+func JanosHMACSHA256ForTest(key, msg []byte) [32]byte {
+	return janosHMACSHA256(key, msg)
+}
+
+// JanosHKDFExpand32ForTest exposes the runtime's HKDF-Expand-SHA256
+// (specialized to 32 bytes) for validation against RFC 5869 vectors.
+func JanosHKDFExpand32ForTest(prk, info []byte) [32]byte {
+	return janosHKDFExpand32(prk, info)
+}
+
+// JanosIdentityKDFSaltForTest exposes the KDF salt derivation used
+// by Identity.Derive so tests can verify order-independence (sort by
+// lex, then concatenate the two public points).
+func JanosIdentityKDFSaltForTest(a, b []byte) []byte {
+	return janosIdentityKDFSalt(a, b)
+}
+
+// JanosDeriveIdentityKeyForTest exposes the deterministic (index →
+// priv, pub) derivation so tests can verify that d·G matches the
+// stored PublicPoint for any given index and root key.  Reads the
+// current process-wide janosRootKey.
+func JanosDeriveIdentityKeyForTest(idx uint64) (priv [32]byte, pub [64]byte) {
+	return janosDeriveIdentityKey(idx)
+}
+
+// TamperIdentityIndexForTest returns a copy of id with a rewritten
+// Index but the same underlying block pointer.  External tests use
+// this to verify that Derive rejects the tampered value.  Cannot be
+// constructed from user code because Identity.block is unexported.
+func TamperIdentityIndexForTest(id Identity, newIdx uint64) Identity {
+	id.Index = newIdx
+	return id
+}
+
+// TamperIdentityPublicPointForTest returns a copy of id with one
+// byte of PublicPoint flipped but the same block pointer.  Same
+// purpose as TamperIdentityIndexForTest.
+func TamperIdentityPublicPointForTest(id Identity) Identity {
+	id.PublicPoint[0] ^= 0xFF
+	return id
+}
+
+// IdentityBlockPointerEqualForTest reports whether two Identities
+// point at the same identityBlock, independent of the visible
+// fields.  Distinguishes "same identity by == (all fields match)"
+// from "same block pointer, different visible fields (tampered)".
+func IdentityBlockPointerEqualForTest(a, b Identity) bool {
+	return a.block == b.block
+}
+
+// VerifyChainSlotForTest exposes the runtime's JANOSCRT chain
+// verifier to external tests so they can drive it end-to-end with
+// synthesized slot bytes.  Same signature as janosVerifyChainSlot;
+// returns the compact ok bool instead of the tuple to keep the
+// test surface small.
+func VerifyChainSlotForTest(slot []byte, binaryHash [32]byte,
+	expectGuildPK, expectReleasePK *[64]byte) bool {
+	_, _, _, _, ok := janosVerifyChainSlot(slot, binaryHash, expectGuildPK, expectReleasePK)
+	return ok
+}

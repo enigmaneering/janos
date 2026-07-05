@@ -15,6 +15,20 @@ jobs:
     - name: Compile Go with all.bash
       run: |
         cd colonel/src ; ./all.bash
+    - name: Run JanOS runtime tests (identity, sanitize, self, provenance, chain-verify)
+      run: |
+        GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 300s \
+          -run "TestIdentify|TestSpark|TestDerive|TestKDFSalt|TestHMACSHA256|TestHKDFExpand32|TestSelf|TestJanosSanitize|TestJanosVerifyChainSlot|TestJanosCanonicalHash|TestJanosProvenance|TestJanosP256|TestInstanceID" \
+          ./colonel/src/runtime/
+    - name: Run JanOS sync tests (Idempotent)
+      run: |
+        GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 300s \
+          -run "TestIdempotent" \
+          ./colonel/src/sync/
+    - name: Run JanOS toolchain tests (signet, diviner, mockdiviner)
+      run: |
+        GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -tags janos_signtest -timeout 120s \
+          ./colonel/src/cmd/janos/...
     - name: Run Go distribution tests under tamago/amd64
       run: |
         GO_BUILDER_NAME=tamago GOOS=tamago GOARCH=amd64 ./colonel/bin/go tool dist test
