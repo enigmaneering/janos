@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,6 +33,39 @@ var permitted = [][]byte{
 	[]byte("//go:build !nethttpomithttp2"), // hack to pacify h2_bundle, which drops copyright header
 }
 
+// isJanosAuthored reports whether path is a JanOS-authored file that
+// deliberately does not carry a copyright header.  Per the convention
+// documented in colonel/additions.md, JanOS-original files start
+// directly with their doc comment / build tag / package declaration;
+// only files with a pre-existing upstream Go / Inferno header get an
+// appended "Copyright The Enigmaneering Guild" line.  The pre-existing
+// files are covered by TestCopyright's normal check (they still contain
+// "Copyright"); the JanOS-original files need this skip.
+func isJanosAuthored(path string) bool {
+	// Files whose base name starts with "janos_" or "janos-" are ours.
+	base := filepath.Base(path)
+	if strings.HasPrefix(base, "janos_") || strings.HasPrefix(base, "janos-") {
+		return true
+	}
+	// Files in JanOS-authored subtrees.
+	// Use forward slashes for portable matching.
+	slashPath := filepath.ToSlash(path)
+	janosDirs := []string{
+		"/src/cmd/janos/",
+		"/src/internal/runtime/janos_hash/",
+		"/src/quantum/",
+	}
+	for _, d := range janosDirs {
+		if strings.Contains(slashPath, d) {
+			return true
+		}
+	}
+	// Files in cmd/link/internal/ld/ whose base starts with "janos_"
+	// are covered by the base check above; other files there keep
+	// their Inferno-lineage headers.
+	return false
+}
+
 func TestCopyright(t *testing.T) {
 	testenv.MustHaveSource(t)
 	buf := make([]byte, 2048)
@@ -44,6 +78,13 @@ func TestCopyright(t *testing.T) {
 			return nil
 		case ".s", ".go":
 			// check
+		}
+		// JanOS convention: JanOS-original files carry no copyright
+		// header.  Modified upstream Go/tamago/Inferno files DO carry
+		// an appended Enigmaneering Guild line and are covered by the
+		// normal Copyright substring check below.
+		if isJanosAuthored(path) {
+			return nil
 		}
 
 		f, err := os.Open(path)

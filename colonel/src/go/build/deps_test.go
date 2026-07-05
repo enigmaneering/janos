@@ -111,6 +111,7 @@ var depsRules = `
 	< internal/runtime/maps
 	< internal/runtime/cgroup
 	< internal/runtime/gc/scan
+	< internal/runtime/janos_hash
 	< runtime
 	< runtime/secret
 	< sync/atomic
