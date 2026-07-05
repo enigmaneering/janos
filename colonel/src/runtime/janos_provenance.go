@@ -45,10 +45,54 @@ type gProvenance struct {
 	// releaseCertID is SHA-256 of the Release signer's public key.
 	// See runtime.ReleaseCert() for the full Certificate.
 	releaseCertID [32]byte
+	// _self is the storage backing runtime.Self().  A pointer to this
+	// field is what Self() returns.  Deliberately placed BEFORE the
+	// trailing padding so the compiler doesn't inject a stray byte to
+	// preserve pointer-aliasing distinctness at the end of the struct.
+	// self is presently a zero-sized type, but callers still get a
+	// non-nil valid pointer to it.
+	_self self
 	// trustLevel records how the current identity was established.
 	trustLevel TrustLevel
 	// _ padding — keeps the struct 8-byte aligned regardless of GOARCH.
 	_ [7]byte
+}
+
+// self is the runtime-facing identity view of a goroutine.  Deliberately
+// unexported: external code can invoke exported methods on a *self
+// obtained from runtime.Self(), but cannot declare variables of its
+// type, cannot forge one, cannot pass a materialized identity across
+// package boundaries.  Self identity stays runtime-scoped.
+//
+// Colonels built with the same compiler share the *function*
+// runtime.Self, and each calls it locally to get its own identity.
+// That's how peers can converse in a shared codebase ("please pair
+// with this device") without either side handing the other a
+// transferable identity token.
+//
+// Zero-fielded for now — future work grows this with hardware
+// access surfaces (Bluetooth, HID, TPM handles), the goroutine's
+// quantum identity index, and whatever else self-scoped state
+// warrants.
+type self struct {
+}
+
+// Self returns a vector to the current goroutine's self.  The
+// returned pointer's type is not exported, but its methods are —
+// callers use it as a fluent receiver:
+//
+//	runtime.Self().Bluetooth().Pair(...)
+//	runtime.Self().HID().Enumerate()
+//
+// The function itself (`runtime.Self`, without parens) is a
+// first-class value that can be passed to another goroutine or
+// colonel.  When the receiver calls it, they get *their own* self
+// in *their own* context — Self is context-sensitive by
+// construction, not a snapshot.
+//
+//go:nosplit
+func Self() *self {
+	return &getg().provenance._self
 }
 
 // janosInitInstanceID populates the current g's instance ID with 16
