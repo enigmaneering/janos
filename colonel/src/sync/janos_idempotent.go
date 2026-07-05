@@ -8,10 +8,10 @@
 //
 // The identities are runtime.Identity values.  Two goroutines that
 // share an identity via `go` inheritance present identical Identity
-// values; a fork-child presents a distinct Identity.  Callers who
-// want "once per THIS goroutine" pass runtime.Identify() explicitly;
-// callers who want "once per collection of peers" pass the
-// participants' Identity values.
+// values; a spark-child (from runtime.Spark) presents a distinct
+// Identity.  Callers who want "once per THIS goroutine" pass
+// runtime.Identify() explicitly; callers who want "once per
+// collection of peers" pass the participants' Identity values.
 //
 // Cleanup: when an identity block dies (all goroutines referring to
 // it have been GC'd), any entries in any Idempotent whose collective

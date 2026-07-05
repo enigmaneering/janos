@@ -8,8 +8,14 @@
 //   - A private scalar d that never leaves the runtime.
 //
 // `go`-spawned children pointer-copy the parent's identityBlock — same
-// keys, same signatures, same Identity by ==.  `fork`-spawned children
-// mint a fresh identityBlock with a new Index and new derived keys.
+// keys, same signatures, same Identity by ==.  runtime.Spark spawns a
+// child with a fresh identityBlock (new Index, new derived keys) —
+// this is the fundamental "certified ignition" primitive from which
+// all identity-fresh execution contexts descend.  A Glitter program's
+// `spark` entry point lowers to runtime.Spark for the standard-goroutine
+// path; compute-shader entry points and sparklet subprocesses follow
+// their own codepaths but are the same primitive at the identity
+// layer — every spark begins with a fresh derived identity.
 //
 // The private-key material is guarded by three layers:
 //
@@ -123,8 +129,8 @@ func (id Identity) Derive(other ...byte) ([]byte, error) {
 }
 
 // janosMintIdentity allocates and populates a fresh identityBlock.
-// Called from schedinit for the main goroutine and from Fork for
-// fork-descendants.  Ownership is not tracked at mint time — Derive
+// Called from schedinit for the main goroutine and from Spark for
+// spark-descendants.  Ownership is not tracked at mint time — Derive
 // authorizes the caller by comparing their current
 // provenance.identity to the block, so any goroutine that inherits
 // the block via the normal newproc1 copy is a valid caller.
@@ -188,7 +194,7 @@ func (b *janosAtomicBool) Store(v bool) {
 
 // janosLateFinalizerInit is called from runtime.main just before user
 // main runs.  Attaches the deferred finalizer to the main goroutine's
-// identityBlock and flips janosFinalizersReady so subsequent Fork
+// identityBlock and flips janosFinalizersReady so subsequent Spark
 // calls attach synchronously.
 func janosLateFinalizerInit() {
 	if janosDeferredFinalizerBlock != nil {
@@ -199,7 +205,7 @@ func janosLateFinalizerInit() {
 }
 
 // janosFreshInstanceID draws 16 random bytes to form a new
-// InstanceID.  Used by Fork so the child is distinguishable at the
+// InstanceID.  Used by Spark so the child is distinguishable at the
 // InstanceID level in addition to having a distinct identityBlock.
 //
 //go:nosplit
@@ -392,21 +398,27 @@ func Identify() Identity {
 	}
 }
 
-// Fork spawns f as a new goroutine with a fresh identity.  The
-// parent's InstanceID is recorded on the child's identityBlock; a
-// fresh InstanceID is also assigned to the child so the fork is
-// distinguishable at that level too.
+// Spark spawns f as a new goroutine with a fresh identity — the
+// fundamental "certified ignition" primitive from which all identity-
+// fresh execution contexts descend.  The parent's InstanceID is
+// recorded on the child's identityBlock; a fresh InstanceID is also
+// assigned to the child so the spark is distinguishable at that
+// level too.
 //
-// Path B: the identityBlock and the fresh InstanceID are minted in
-// the PARENT goroutine before the go spawn.  The child's very first
-// instructions install the pre-minted identity into its provenance;
-// no user code runs on the child with the inherited-then-replaced
-// identity in scope.
+// The identityBlock and the fresh InstanceID are minted in the PARENT
+// goroutine before the go spawn.  The child's very first instructions
+// install the pre-minted identity into its provenance; no user code
+// runs on the child with the inherited-then-replaced identity in
+// scope.
 //
-// A future `fork` keyword lowers to this function.  Distinct from
-// `go`: `go`-spawned goroutines share the parent's identityBlock
-// (equal Identity by ==); Fork-spawned goroutines mint their own.
-func Fork(f func()) {
+// Distinct from `go`: `go`-spawned goroutines share the parent's
+// identityBlock (equal Identity by ==); Spark-spawned goroutines mint
+// their own.  A Glitter program's `spark` entry point lowers to this
+// function for the standard goroutine path.  Compute-shader entry
+// points and sparklet subprocesses are "sparked" too, but follow
+// their own downstream codepaths for the actual execution — the
+// identity-mint step at the head of every spark is universal.
+func Spark(f func()) {
 	parentInstanceID := getg().provenance.instanceID
 	newBlock := janosMintIdentity(parentInstanceID)
 	freshIID := janosFreshInstanceID()
