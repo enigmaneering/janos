@@ -52,6 +52,11 @@ type gProvenance struct {
 	// self is presently a zero-sized type, but callers still get a
 	// non-nil valid pointer to it.
 	_self self
+	// identity points at this goroutine's identityBlock.  Populated
+	// for main at schedinit and never nil after that; `go`-descendants
+	// pointer-copy from the parent (shared identity); Fork descendants
+	// mint a fresh block.  See janos_identity.go.
+	identity *identityBlock
 	// trustLevel records how the current identity was established.
 	trustLevel TrustLevel
 	// _ padding — keeps the struct 8-byte aligned regardless of GOARCH.

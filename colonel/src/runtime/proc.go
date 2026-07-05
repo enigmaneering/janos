@@ -895,6 +895,7 @@ func schedinit() {
 	janosInitInstanceID() // JanOS: assign this process's runtime instance ID
 	janosInitBinaryHash() // JanOS: self-hash the binary and populate BinaryHash + TrustLevel
 	janosVerifyCertSlot() // JanOS: verify the JANOSCRT chain in this binary (no-op on undivined builds)
+	janosInitIdentity()   // JanOS: mint the root key + the main goroutine's Identity
 	modulesinit()   // provides activeModules
 	typelinksinit() // uses maps, activeModules
 	itabsinit()     // uses activeModules
