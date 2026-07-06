@@ -12,9 +12,15 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y binfmt-support qemu-user-static
-    - name: Compile Go with all.bash
+    - name: Compile Go toolchain with make.bash
       run: |
-        cd colonel/src ; ./all.bash
+        cd colonel/src ; ./make.bash
+      # NOTE: we use make.bash (build only) rather than all.bash (build
+      # + run stock Go's full test suite) because the cmd/go script
+      # tests routinely time out under the free-tier GitHub runner
+      # constraint (4 vCPU, 16GB) — they're not JanOS-related.  The
+      # JanOS-specific test steps below cover our additions; the
+      # tamago dist tests further down cover cross-arch soundness.
     - name: Run JanOS runtime tests (identity, sanitize, self, provenance, chain-verify)
       run: |
         GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 300s \
