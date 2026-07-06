@@ -25,7 +25,6 @@ package sync
 
 import (
 	"runtime"
-	"unsafe"
 	"weak"
 	_ "unsafe" // for go:linkname
 )
@@ -163,19 +162,49 @@ func (i *Idempotent) evictBlock(addr uintptr) {
 }
 
 // collectiveKey folds a slice of Identity values into a single
-// [80]byte key by byte-wise XOR.  XOR is commutative and associative,
-// so the resulting key is independent of argument order.  With no
-// identities the key is the zero value, which reserves the
-// program-wide slot.
+// [80]byte key by byte-wise XOR of an architecture-agnostic
+// encoding of each identity:
+//
+//	bytes  0..7:   Index               (little-endian uint64)
+//	bytes  8..71:  PublicPoint         (X‖Y, 64 bytes)
+//	bytes 72..79:  block pointer addr  (uintptr zero-extended to 8 bytes)
+//
+// This avoids the pitfalls of reinterpreting the Identity struct as
+// [80]byte via unsafe.Pointer — Go's Identity layout differs across
+// architectures (pointer width, tail padding), so a byte-for-byte
+// struct view is not portable.
+//
+// XOR is commutative and associative, so the resulting key is
+// independent of argument order.  With no identities the key is the
+// zero value, which reserves the program-wide slot.
 func collectiveKey(ids []runtime.Identity) [80]byte {
 	var key [80]byte
 	if len(ids) == 0 {
 		return key
 	}
+	var one [80]byte
 	for _, id := range ids {
-		bits := *(*[80]byte)(unsafe.Pointer(&id))
+		// Wipe scratch so per-identity encodings don't leak between
+		// iterations.
+		for j := range one {
+			one[j] = 0
+		}
+		// Index at bytes 0..7 in little-endian.
+		for j := uint(0); j < 8; j++ {
+			one[j] = byte(id.Index >> (j * 8))
+		}
+		// PublicPoint at bytes 8..71.
+		copy(one[8:72], id.PublicPoint[:])
+		// Block pointer as uint64 at bytes 72..79.  On 32-bit
+		// systems the uintptr is 4 bytes; zero-extending to 8 gives
+		// the same 80-byte layout on every architecture.
+		addr := uint64(runtimeIdentityBlockAddr(id))
+		for j := uint(0); j < 8; j++ {
+			one[72+j] = byte(addr >> (j * 8))
+		}
+		// XOR-fold into the accumulator.
 		for j := range key {
-			key[j] ^= bits[j]
+			key[j] ^= one[j]
 		}
 	}
 	return key
