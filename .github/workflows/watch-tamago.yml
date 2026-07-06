@@ -1,0 +1,153 @@
+name: Watch tamago upstream
+
+on:
+  schedule:
+    # 12:17 UTC daily.  Odd minute reduces contention on the shared
+    # cron runner queue (everyone else picks :00).
+    - cron: '17 12 * * *'
+  workflow_dispatch:
+
+# NOTE: GitHub does not expose webhook subscriptions to other repos'
+# releases, so a scheduled poll is the only self-contained option.
+# The poll is very cheap: a `git ls-remote` and a `gh issue list`.
+# Nothing is written unless a new upstream release appears and no
+# tracking issue already covers it.
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Fetch upstream tags
+      run: |
+        git remote add upstream https://github.com/usbarmory/tamago-go.git
+        git fetch upstream --tags --no-recurse-submodules
+
+    - name: Compare current base against latest upstream tag
+      id: compare
+      run: |
+        LATEST=$(git tag -l 'tamago-go*' --sort=-v:refname | head -1)
+        CURRENT=$(git tag -l 'tamago-go*' --merged HEAD --sort=-v:refname | head -1)
+        echo "Latest upstream: ${LATEST:-<none>}"
+        echo "Current base:    ${CURRENT:-<none>}"
+        if [ -z "$LATEST" ]; then
+          echo "No tamago-go tags visible upstream; nothing to do."
+          echo "action=none" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if [ "$LATEST" = "$CURRENT" ]; then
+          echo "Already at the latest upstream release."
+          echo "action=none" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "action=notify" >> "$GITHUB_OUTPUT"
+        echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+        echo "current=${CURRENT:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Skip if a tracking issue already exists
+      id: existing
+      if: steps.compare.outputs.action == 'notify'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        LATEST: ${{ steps.compare.outputs.latest }}
+      run: |
+        MATCH=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+          --state all \
+          --search "in:title \"$LATEST\"" \
+          --json number,title \
+          --limit 5 \
+          | jq -r --arg t "$LATEST" '.[] | select(.title | contains($t)) | .number' \
+          | head -1)
+        if [ -n "$MATCH" ]; then
+          echo "Issue #$MATCH already tracks $LATEST — skipping."
+          echo "skip=yes" >> "$GITHUB_OUTPUT"
+        else
+          echo "No existing tracking issue for $LATEST."
+        fi
+
+    - name: Open tracking issue
+      if: steps.compare.outputs.action == 'notify' && steps.existing.outputs.skip != 'yes'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        LATEST: ${{ steps.compare.outputs.latest }}
+        CURRENT: ${{ steps.compare.outputs.current }}
+      run: |
+        cat > /tmp/body.md <<EOF
+        A new tamago-go release is available upstream: **$LATEST**.
+
+        | | |
+        |---|---|
+        | Current base | \`$CURRENT\` |
+        | Latest upstream | \`$LATEST\` |
+        | Release | https://github.com/usbarmory/tamago-go/releases/tag/$LATEST |
+        | Changelog | https://github.com/usbarmory/tamago-go/compare/$CURRENT...$LATEST |
+
+        ## Reconciliation
+
+        Run locally on the JanOS working tree:
+
+        \`\`\`bash
+        cd ~/source/enigmaneering/janos
+        git fetch upstream --tags
+        git checkout master
+        git pull --ff-only origin master
+
+        git merge --squash -s recursive -X subtree=colonel/ upstream/$LATEST
+        \`\`\`
+
+        Resolve conflicts favoring JanOS-additive intent, especially in:
+
+        - \`colonel/src/runtime/proc.go\`
+        - \`colonel/src/runtime/mgcsweep.go\`
+        - \`colonel/src/runtime/stack.go\`
+        - \`colonel/src/runtime/sizeof_test.go\`
+        - \`colonel/src/runtime/janos_provenance.go\`
+        - \`colonel/src/cmd/link/internal/ld/main.go\`
+        - \`colonel/src/cmd/dist/buildtool.go\`
+        - \`colonel/src/go/build/deps_test.go\`
+        - \`colonel/src/internal/copyright/copyright_test.go\`
+
+        Sanity-check that no JanOS additions live in \`colonel/src/cmd/\` outside of \`janos/\` (output should be empty):
+
+        \`\`\`bash
+        grep -rln "janos\\|JanOS\\|Enigmaneering" colonel/src/cmd/ \\
+          | grep -vE "/janos/|janos_"
+        \`\`\`
+
+        Rebuild and run the JanOS test surface:
+
+        \`\`\`bash
+        cd colonel/src && ./make.bash
+        cd ..
+        GOROOT="\$(pwd)" ./bin/go test -count=1 -timeout 300s \\
+          -run "TestIdentify|TestSpark|TestDerive|TestKDFSalt|TestHMACSHA256|TestHKDFExpand32|TestSelf|TestJanosSanitize|TestJanosVerifyChainSlot|TestJanosCanonicalHash|TestJanosProvenance|TestJanosP256|TestInstanceID|TestSizeof" \\
+          ./src/runtime/
+        GOROOT="\$(pwd)" ./bin/go test -count=1 -timeout 300s \\
+          -run "TestIdempotent" \\
+          ./src/sync/
+        GOROOT="\$(pwd)" ./bin/go test -count=1 -tags janos_signtest -timeout 120s \\
+          ./src/cmd/janos/...
+        \`\`\`
+
+        If everything is green, land it:
+
+        \`\`\`bash
+        git commit -m "colonel: sync to upstream $LATEST"
+        git push origin master
+        \`\`\`
+
+        ---
+
+        _Auto-opened by [\`.github/workflows/watch-tamago.yml\`](../blob/master/.github/workflows/watch-tamago.yml).  Close this issue when the sync lands on master; the workflow won't reopen it._
+        EOF
+
+        gh issue create --repo "$GITHUB_REPOSITORY" \
+          --title "Sync colonel/ to upstream $LATEST" \
+          --body-file /tmp/body.md
