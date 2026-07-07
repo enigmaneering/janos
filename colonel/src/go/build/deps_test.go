@@ -249,6 +249,7 @@ var depsRules = `
 	  internal/types/errors,
 	  mime/quotedprintable,
 	  net/internal/socktest,
+	  runtime/genesis,
 	  runtime/trace,
 	  text/scanner,
 	  text/tabwriter;

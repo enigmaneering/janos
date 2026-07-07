@@ -31,6 +31,10 @@ jobs:
         GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 300s \
           -run "TestIdempotent" \
           ./colonel/src/sync/
+    - name: Run JanOS genesis tests (Trait, Self, SparkAs)
+      run: |
+        GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 300s \
+          ./colonel/src/runtime/genesis/
     - name: Run JanOS toolchain tests (signet, diviner, mockdiviner)
       run: |
         GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -tags janos_signtest -timeout 120s \
