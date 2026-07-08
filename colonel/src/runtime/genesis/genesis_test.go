@@ -679,3 +679,148 @@ func TestDeferSelfNilPanics(t *testing.T) {
 	}()
 	DeferSelf(nil)
 }
+
+// -- Inception --------------------------------------------------------
+
+// TestInceptionMainIsBootStamp: the main identity's inception comes
+// from the runtime's schedinit walltime stamp — nonzero, in the past,
+// and recent (this test binary just booted).  Two reads agree.
+func TestInceptionMainIsBootStamp(t *testing.T) {
+	self, err := CurrentSelf()
+	if err != nil {
+		t.Fatalf("CurrentSelf: %v", err)
+	}
+	inc := self.Inception()
+	if inc.IsZero() {
+		t.Fatal("main inception is zero — boot stamp did not propagate")
+	}
+	if !inc.Before(time.Now()) {
+		t.Errorf("main inception %v is not in the past", inc)
+	}
+	if age := time.Since(inc); age > 10*time.Minute {
+		t.Errorf("main inception %v is %v old — implausible for a test binary that just started", inc, age)
+	}
+	again, err := CurrentSelf()
+	if err != nil {
+		t.Fatalf("second CurrentSelf: %v", err)
+	}
+	if !again.Inception().Equal(inc) {
+		t.Errorf("inception not stable: %v then %v", inc, again.Inception())
+	}
+}
+
+// TestInceptionSparkAsBounds: a spark's inception is captured at the
+// top of the SparkAs call — at or after a timestamp taken just before
+// the call, and at or before one taken inside the work function.
+func TestInceptionSparkAsBounds(t *testing.T) {
+	if err := closePhase(); err != nil && !errors.Is(err, errPhaseClosed) {
+		t.Fatalf("parent closePhase: %v", err)
+	}
+	before := time.Now()
+	done := make(chan struct{})
+	var inc, during time.Time
+	err := SparkAs(
+		func(p traitPrimary) {
+			defer close(done)
+			during = time.Now()
+			self, err := CurrentSelf()
+			if err != nil {
+				t.Errorf("child CurrentSelf: %v", err)
+				return
+			}
+			inc = self.Inception()
+		},
+		func() traitPrimary { return traitPrimary{role: "inception"} },
+	)
+	if err != nil {
+		t.Fatalf("SparkAs: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("spark did not complete")
+	}
+	if inc.IsZero() {
+		t.Fatal("spark inception is zero")
+	}
+	if inc.Before(before) {
+		t.Errorf("inception %v predates the SparkAs call (before=%v)", inc, before)
+	}
+	if during.Before(inc) {
+		t.Errorf("work ran at %v, before its own inception %v", during, inc)
+	}
+}
+
+// TestInceptionSharedByGoChildren: a `go` child shares the spark's
+// identity and therefore its inception.
+func TestInceptionSharedByGoChildren(t *testing.T) {
+	if err := closePhase(); err != nil && !errors.Is(err, errPhaseClosed) {
+		t.Fatalf("parent closePhase: %v", err)
+	}
+	done := make(chan struct{})
+	var sparkInc, childInc time.Time
+	err := SparkAs(
+		func(p traitPrimary) {
+			self, _ := CurrentSelf()
+			sparkInc = self.Inception()
+			inner := make(chan struct{})
+			go func() {
+				defer close(inner)
+				cs, err := CurrentSelf()
+				if err != nil {
+					t.Errorf("go-child CurrentSelf: %v", err)
+					return
+				}
+				childInc = cs.Inception()
+			}()
+			<-inner
+			close(done)
+		},
+		func() traitPrimary { return traitPrimary{role: "inheritance"} },
+	)
+	if err != nil {
+		t.Fatalf("SparkAs: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("spark did not complete")
+	}
+	if !childInc.Equal(sparkInc) {
+		t.Errorf("go-child inception %v != spark inception %v", childInc, sparkInc)
+	}
+}
+
+// TestInceptionDistinctAcrossSequentialSparks: two sparks created in
+// sequence carry ordered, distinct inceptions.
+func TestInceptionDistinctAcrossSequentialSparks(t *testing.T) {
+	if err := closePhase(); err != nil && !errors.Is(err, errPhaseClosed) {
+		t.Fatalf("parent closePhase: %v", err)
+	}
+	grab := func() time.Time {
+		done := make(chan time.Time, 1)
+		err := SparkAs(
+			func(p traitPrimary) {
+				self, _ := CurrentSelf()
+				done <- self.Inception()
+			},
+			func() traitPrimary { return traitPrimary{role: "seq"} },
+		)
+		if err != nil {
+			t.Fatalf("SparkAs: %v", err)
+		}
+		select {
+		case v := <-done:
+			return v
+		case <-time.After(5 * time.Second):
+			t.Fatal("spark did not report")
+			return time.Time{}
+		}
+	}
+	first := grab()
+	time.Sleep(5 * time.Millisecond)
+	second := grab()
+	if !first.Before(second) {
+		t.Errorf("sequential sparks not ordered: first=%v second=%v", first, second)
+	}
+}

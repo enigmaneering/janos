@@ -28,7 +28,9 @@
 //   - TraitOf[T](filters ...string) — query a trait by type,
 //     optionally narrowed by module and/or package.
 //   - CurrentSelf() — read the assembled Self (the frozen bag of
-//     Traits for this goroutine's identity).
+//     Traits for this goroutine's identity).  Self.Inception()
+//     reports the moment the spark was created: schedinit's identity
+//     mint for main, the top of the SparkAs call for children.
 //   - SparkAs[TC] — spawn a fresh-identity goroutine with its own
 //     genesis phase; the primary init produces the value that the
 //     child's work function receives directly.
@@ -109,6 +111,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"time"
 	_ "unsafe" // for go:linkname
 )
 
@@ -132,6 +135,22 @@ type Trait struct {
 // downstream code can find it via TraitOf[T](...) or by filter.
 type Self struct {
 	Traits []Trait
+	// inception is when this spark came into being.  Unexported so a
+	// Self cannot be forged with a fabricated birth time; read it via
+	// the Inception method.
+	inception time.Time
+}
+
+// Inception returns the moment this spark was created.
+//
+// For the main identity this is stamped at schedinit — when the
+// runtime mints the program's identity, before any package init or
+// user code runs.  For a SparkAs child it is captured as the very
+// first action of the SparkAs call, on the parent's goroutine,
+// before the child is spawned.  Goroutines sharing an identity via
+// `go` inheritance share their spark's inception.
+func (s Self) Inception() time.Time {
+	return s.inception
 }
 
 // Sentinel errors returned by the public API.
@@ -205,6 +224,12 @@ type selfState struct {
 	// any point in the spark's life — cleanup code appears wherever
 	// the resource it releases was created.
 	deferred []func(*sync.WaitGroup)
+	// inception is when this spark came into being.  Main's is the
+	// runtime's boot walltime stamp (schedinit); a SparkAs child's is
+	// captured at the top of the SparkAs call.  Identities minted
+	// outside the public lifecycle (internal test paths) leave it
+	// zero.
+	inception time.Time
 }
 
 // registry maps identityBlock address -> selfState.  Populated
@@ -250,6 +275,14 @@ func runtimeSetGenesisClosePhaseHook(fn func())
 //
 //go:linkname runtimeJanosSpark runtime.janosSpark
 func runtimeJanosSpark(f func())
+
+// runtimeBootWalltime is runtime.janosBootWalltime reached via
+// linkname: the wall-clock stamp taken at schedinit when the main
+// goroutine's identity was minted.  Backs Self.Inception for the
+// main identity.
+//
+//go:linkname runtimeBootWalltime runtime.janosBootWalltime
+func runtimeBootWalltime() (int64, int32)
 
 func init() {
 	runtimeRegisterBlockFinalizedHook(onBlockFinalized)
@@ -314,6 +347,13 @@ func stateForCurrent() *selfState {
 		return st
 	}
 	st := &selfState{typeIdx: map[reflect.Type]int{}}
+	if addr == mainBlockAddr {
+		// Main's inception is the runtime's schedinit stamp — the
+		// moment the program's identity was minted, before any
+		// package init ran.
+		sec, nsec := runtimeBootWalltime()
+		st.inception = time.Unix(sec, int64(nsec))
+	}
 	registry[addr] = st
 	return st
 }
@@ -491,7 +531,7 @@ func CurrentSelf() (Self, error) {
 	}
 	traits := make([]Trait, len(st.traits))
 	copy(traits, st.traits)
-	return Self{Traits: traits}, nil
+	return Self{Traits: traits, inception: st.inception}, nil
 }
 
 // TraitOf returns the Trait of type T from the current goroutine's
@@ -811,6 +851,10 @@ func SparkAs[TC any](
 	primaryInit func() TC,
 	additionalInits ...func() any,
 ) error {
+	// Inception is the very first thing a spark acquires — captured
+	// before validation, before the child exists.  The spark's birth
+	// is the moment its creation was asked for.
+	inception := time.Now()
 	if work == nil {
 		return errors.New("genesis: SparkAs work function is nil")
 	}
@@ -826,6 +870,10 @@ func SparkAs[TC any](
 		if st == nil {
 			fatalMissingIdentity("SparkAs child")
 		}
+		// The child's first recorded fact is its birth time.
+		st.mu.Lock()
+		st.inception = inception
+		st.mu.Unlock()
 		// Spark-exit deferral: drain when work returns OR panics.
 		// Installed before the inits so a cleanup registered inside
 		// primaryInit/additionalInits still runs if a later init (or
