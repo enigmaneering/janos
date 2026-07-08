@@ -13,17 +13,32 @@ import (
 // primitive is unexported in runtime — user code spawns fresh-identity
 // goroutines only through runtime/genesis.SparkAs — but tests in this
 // package need distinct identities to exercise Idempotent's per-
-// collective slotting.  Linkname is the sanctioned escape hatch for
+// identity slotting.  Linkname is the sanctioned escape hatch for
 // this exact scenario.
 //
 //go:linkname runtimeJanosSpark runtime.janosSpark
 func runtimeJanosSpark(f func())
 
 // -----------------------------------------------------------------
-// No-args behavior: identical to sync.Once
+// Basic sanity
 // -----------------------------------------------------------------
 
-func TestIdempotentNoArgsRunsOnce(t *testing.T) {
+func TestIdempotentZeroValueReady(t *testing.T) {
+	var idem sync.Idempotent
+	// Zero-value Idempotent's first Do must succeed without panic or
+	// deadlock — the entries map is lazily allocated.
+	idem.Do(func() {})
+}
+
+// -----------------------------------------------------------------
+// Inheritance: goroutines sharing an identity share a once-slot
+// -----------------------------------------------------------------
+
+// TestIdempotentInheritedIdentityFiresOnce spawns N goroutines with
+// plain `go`, so all share the test goroutine's identity.  Every
+// concurrent Do call keys on that same identity and the function
+// runs exactly once.
+func TestIdempotentInheritedIdentityFiresOnce(t *testing.T) {
 	var idem sync.Idempotent
 	var count atomic.Int32
 	var wg sync.WaitGroup
@@ -35,45 +50,20 @@ func TestIdempotentNoArgsRunsOnce(t *testing.T) {
 			idem.Do(func() { count.Add(1) })
 		}()
 	}
+	idem.Do(func() { count.Add(1) }) // parent also fires
 	wg.Wait()
 	if got := count.Load(); got != 1 {
-		t.Fatalf("f ran %d times across %d concurrent Do calls, want 1", got, n)
+		t.Fatalf("inherited-identity Do fired %d times, want 1", got)
 	}
-}
-
-func TestIdempotentZeroValueReady(t *testing.T) {
-	var idem sync.Idempotent
-	// Should not panic or deadlock on first use of a zero-value
-	// Idempotent, including with lazy internal map allocation.
-	idem.Do(func() {})
 }
 
 // -----------------------------------------------------------------
-// Single-identity: shared vs distinct
+// Sparks: distinct identities fire independently
 // -----------------------------------------------------------------
 
-func TestIdempotentSharedIdentityFiresOnce(t *testing.T) {
-	var idem sync.Idempotent
-	var count atomic.Int32
-	me := runtime.Identify()
-
-	var wg sync.WaitGroup
-	const n = 100
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		// go-inheritance means the child sees the same Identity.
-		go func() {
-			defer wg.Done()
-			idem.Do(func() { count.Add(1) }, runtime.Identify())
-		}()
-	}
-	idem.Do(func() { count.Add(1) }, me) // parent also fires
-	wg.Wait()
-	if got := count.Load(); got != 1 {
-		t.Fatalf("shared-identity Do fired %d times, want 1", got)
-	}
-}
-
+// TestIdempotentDistinctSparksFireIndependently spawns N goroutines
+// each with a fresh identity via runtimeJanosSpark.  Each spark has
+// its own once-slot, so f runs once per spark — N fires total.
 func TestIdempotentDistinctSparksFireIndependently(t *testing.T) {
 	var idem sync.Idempotent
 	var count atomic.Int32
@@ -81,7 +71,7 @@ func TestIdempotentDistinctSparksFireIndependently(t *testing.T) {
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
 		runtimeJanosSpark(func() {
-			idem.Do(func() { count.Add(1) }, runtime.Identify())
+			idem.Do(func() { count.Add(1) })
 			done <- struct{}{}
 		})
 	}
@@ -93,51 +83,16 @@ func TestIdempotentDistinctSparksFireIndependently(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------
-// Collective idempotency: order-independence + slot distinctness
-// -----------------------------------------------------------------
-
-func TestIdempotentCollectiveOrderIndependent(t *testing.T) {
+// TestIdempotentSameIdentityAcrossMultipleDosIdempotent verifies that
+// repeated Do calls from the same goroutine's identity do not re-fire.
+func TestIdempotentSameIdentityAcrossMultipleDosIdempotent(t *testing.T) {
 	var idem sync.Idempotent
 	var count atomic.Int32
-
-	idA, idB := twoIdentities(t)
-	idem.Do(func() { count.Add(1) }, idA, idB)
-	idem.Do(func() { count.Add(1) }, idB, idA) // same collective, reversed
+	for i := 0; i < 10; i++ {
+		idem.Do(func() { count.Add(1) })
+	}
 	if got := count.Load(); got != 1 {
-		t.Fatalf("collective {A,B} vs {B,A}: fired %d times, want 1", got)
-	}
-}
-
-func TestIdempotentCollectiveDistinctFromSubsets(t *testing.T) {
-	var idem sync.Idempotent
-	var count atomic.Int32
-
-	idA, idB := twoIdentities(t)
-	idem.Do(func() { count.Add(1) }, idA, idB)
-	if got := count.Load(); got != 1 {
-		t.Fatalf("first {A,B} call: fired %d times, want 1", got)
-	}
-	idem.Do(func() { count.Add(1) }, idA) // solo A: distinct slot
-	if got := count.Load(); got != 2 {
-		t.Fatalf("after {A} solo: fired %d times, want 2", got)
-	}
-	idem.Do(func() { count.Add(1) }, idB) // solo B: another distinct slot
-	if got := count.Load(); got != 3 {
-		t.Fatalf("after {B} solo: fired %d times, want 3", got)
-	}
-}
-
-func TestIdempotentEmptyCollectiveIsProgramWide(t *testing.T) {
-	var idem sync.Idempotent
-	var count atomic.Int32
-
-	idem.Do(func() { count.Add(1) })                          // no identities
-	idem.Do(func() { count.Add(1) })                          // still program-wide
-	idem.Do(func() { count.Add(1) }, runtime.Identify())      // solo-me slot
-	if got := count.Load(); got != 2 {
-		t.Fatalf("empty-collective vs solo-me distinguishability: fired %d times, want 2",
-			got)
+		t.Fatalf("10 sequential Dos from same identity fired %d times, want 1", got)
 	}
 }
 
@@ -149,7 +104,7 @@ func TestIdempotentEmptyCollectiveIsProgramWide(t *testing.T) {
 // an Idempotent map are evicted when the identityBlock they keyed on
 // becomes GC-unreachable.  Runs several rounds of Sparks; if entries
 // were NOT evicted, they would accumulate, but the map is unexported
-// so we can't inspect it directly.  Instead we assert the behavior
+// so we can't inspect it directly.  Instead we assert that behavior
 // remains correct across rounds (no false collisions, no leaks that
 // would manifest as f not firing when it should).
 func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
@@ -164,7 +119,7 @@ func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
 			wg.Add(1)
 			runtimeJanosSpark(func() {
 				defer wg.Done()
-				idem.Do(func() { count.Add(1) }, runtime.Identify())
+				idem.Do(func() { count.Add(1) })
 			})
 		}
 		wg.Wait()
@@ -180,30 +135,7 @@ func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
 	want := int64(rounds) * int64(sparksPerRound)
 	got := count.Load()
 	if got != want {
-		t.Fatalf("total fires across %d rounds of %d Sparks: got %d, want %d — either identities collided (mint broken) or cleanup broken",
+		t.Fatalf("total fires across %d rounds of %d Sparks: got %d, want %d — either identities collided (mint broken) or the primitive broke",
 			rounds, sparksPerRound, got, want)
 	}
-}
-
-// -----------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------
-
-// twoIdentities returns two distinct Identity values via Spark.  The
-// Sparked goroutines exit before returning to the caller; the
-// caller uses these values from its own goroutine.  Note: Derive
-// would reject calls from a non-owning goroutine, but map-key
-// operations (including Idempotent.Do) don't invoke Derive — they
-// just compare byte representations.
-func twoIdentities(t *testing.T) (runtime.Identity, runtime.Identity) {
-	t.Helper()
-	ch := make(chan runtime.Identity, 2)
-	runtimeJanosSpark(func() { ch <- runtime.Identify() })
-	runtimeJanosSpark(func() { ch <- runtime.Identify() })
-	a := <-ch
-	b := <-ch
-	if a == b {
-		t.Fatalf("twoIdentities helper produced identical Identities: %d", a.Index)
-	}
-	return a, b
 }
