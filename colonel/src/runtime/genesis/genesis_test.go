@@ -6,7 +6,6 @@ package genesis
 
 import (
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,7 +18,7 @@ import (
 func inSpark(t *testing.T, body func(*testing.T)) {
 	t.Helper()
 	done := make(chan struct{})
-	runtime.Spark(func() {
+	runtimeJanosSpark(func() {
 		defer close(done)
 		body(t)
 	})

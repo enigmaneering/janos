@@ -354,3 +354,14 @@ func VerifyChainSlotForTest(slot []byte, binaryHash [32]byte,
 	_, _, _, _, ok := janosVerifyChainSlot(slot, binaryHash, expectGuildPK, expectReleasePK)
 	return ok
 }
+
+// JanosSparkForTest exposes the fresh-identity spawn primitive to
+// external tests.  Production code has no public wrapper — user code
+// spawns fresh-identity goroutines only through
+// runtime/genesis.SparkAs, which reaches janosSpark via linkname.
+// This helper lets external runtime tests (which cannot depend on
+// runtime/genesis without an import cycle) exercise the primitive
+// directly.
+func JanosSparkForTest(f func()) {
+	janosSpark(f)
+}

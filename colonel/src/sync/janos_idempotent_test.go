@@ -6,7 +6,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	_ "unsafe" // for go:linkname
 )
+
+// runtimeJanosSpark is runtime.janosSpark reached via linkname.  The
+// primitive is unexported in runtime — user code spawns fresh-identity
+// goroutines only through runtime/genesis.SparkAs — but tests in this
+// package need distinct identities to exercise Idempotent's per-
+// collective slotting.  Linkname is the sanctioned escape hatch for
+// this exact scenario.
+//
+//go:linkname runtimeJanosSpark runtime.janosSpark
+func runtimeJanosSpark(f func())
 
 // -----------------------------------------------------------------
 // No-args behavior: identical to sync.Once
@@ -69,7 +80,7 @@ func TestIdempotentDistinctSparksFireIndependently(t *testing.T) {
 	const n = 8
 	done := make(chan struct{}, n)
 	for i := 0; i < n; i++ {
-		runtime.Spark(func() {
+		runtimeJanosSpark(func() {
 			idem.Do(func() { count.Add(1) }, runtime.Identify())
 			done <- struct{}{}
 		})
@@ -151,7 +162,7 @@ func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := 0; i < sparksPerRound; i++ {
 			wg.Add(1)
-			runtime.Spark(func() {
+			runtimeJanosSpark(func() {
 				defer wg.Done()
 				idem.Do(func() { count.Add(1) }, runtime.Identify())
 			})
@@ -187,8 +198,8 @@ func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
 func twoIdentities(t *testing.T) (runtime.Identity, runtime.Identity) {
 	t.Helper()
 	ch := make(chan runtime.Identity, 2)
-	runtime.Spark(func() { ch <- runtime.Identify() })
-	runtime.Spark(func() { ch <- runtime.Identify() })
+	runtimeJanosSpark(func() { ch <- runtime.Identify() })
+	runtimeJanosSpark(func() { ch <- runtime.Identify() })
 	a := <-ch
 	b := <-ch
 	if a == b {

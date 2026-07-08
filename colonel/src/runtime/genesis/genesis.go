@@ -66,11 +66,24 @@
 // A future compiler pass will lift most cases into compile-time
 // errors.
 //
+// # Missing identity is fatal
+//
+// Every JanOS goroutine has an identity: schedinit mints main's,
+// `go` inherits the parent's pointer, janosSpark mints fresh
+// identities for spark children.  If any API in this package
+// discovers the current goroutine has NO identity block, the
+// runtime security invariant has been violated — either a runtime
+// bug or a tampered process state — and the package writes a
+// diagnostic to stderr, dumps every goroutine's stack, and calls
+// os.Exit(2).  There is no exported ErrNoIdentity because user code
+// cannot recover from it.
+//
 package genesis
 
 import (
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"runtime"
 	"sync"
@@ -101,10 +114,6 @@ type Self struct {
 
 // Sentinel errors returned by the public API.
 var (
-	// ErrNoIdentity: the current goroutine has no JanOS identity block.
-	// Should not normally occur — main and every descendant have one.
-	ErrNoIdentity = errors.New("genesis: no identity on current goroutine")
-
 	// ErrPhaseOpen: TraitOf, CurrentSelf, or SparkAs (on the parent)
 	// was called before the current identity's genesis phase closed.
 	// Self is not observable during the gathering phase.
@@ -118,6 +127,31 @@ var (
 	// requested type (and any filters).  Add filters to narrow.
 	ErrAmbiguous = errors.New("genesis: multiple matching traits; add filters")
 )
+
+// fatalMissingIdentity terminates the process when the current
+// goroutine is discovered to have no JanOS identity block.  Under
+// normal runtime operation this cannot happen: schedinit mints the
+// main goroutine's identity, `go` descendants inherit their parent's
+// pointer, and janosSpark mints fresh identities for spark children.
+// A missing identity would mean either a runtime bug or an actively
+// tampered process state — either way, we cannot trust anything the
+// caller is trying to do (registration, query, spawn), and continuing
+// would violate the security posture the whole substrate is built to
+// hold.
+//
+// So we write a diagnostic to stderr, dump every goroutine's stack
+// for the incident report, and os.Exit(2).  No possibility of
+// recover().  No cleanup handlers.  The program is gone.
+func fatalMissingIdentity(where string) {
+	fmt.Fprintf(os.Stderr,
+		"genesis: FATAL: %s called on a goroutine with no JanOS identity — "+
+			"runtime security invariant violated; aborting\n",
+		where)
+	var buf [8192]byte
+	n := runtime.Stack(buf[:], true)
+	os.Stderr.Write(buf[:n])
+	os.Exit(2)
+}
 
 // Internal-only sentinel errors.  Surface through panics from
 // Register or SparkAs's child when the invariants they guard are
@@ -178,6 +212,16 @@ func runtimeRegisterBlockFinalizedHook(fn func(uintptr))
 //
 //go:linkname runtimeSetGenesisClosePhaseHook runtime.janosSetGenesisClosePhaseHook
 func runtimeSetGenesisClosePhaseHook(fn func())
+
+// runtimeJanosSpark is runtime.janosSpark reached via linkname.  It
+// mints a fresh identity, spawns a goroutine on it, and runs f.  The
+// primitive is unexported in runtime because SparkAs is the only
+// public path a spark should take — direct primitive access would
+// allow spawning a fresh identity without engaging the genesis phase
+// machinery, which is exactly the misuse we're preventing.
+//
+//go:linkname runtimeJanosSpark runtime.janosSpark
+func runtimeJanosSpark(f func())
 
 func init() {
 	runtimeRegisterBlockFinalizedHook(onBlockFinalized)
@@ -297,11 +341,12 @@ func parseFuncOrigin(fn string) (module, pkg string) {
 // The Trait's Module and Package are derived from the caller's fully
 // qualified function name.
 //
-// Errors: ErrNoIdentity, errPhaseClosed, errDuplicateType.
+// Errors: errPhaseClosed, errDuplicateType.  A missing identity is
+// fatal (the process aborts) rather than returned as an error.
 func registerTrait[T any](t T) error {
 	st := stateForCurrent()
 	if st == nil {
-		return ErrNoIdentity
+		fatalMissingIdentity("registerTrait")
 	}
 	typ := reflect.TypeOf((*T)(nil)).Elem()
 	module, pkg := callerOrigin()
@@ -329,12 +374,12 @@ func registerTrait[T any](t T) error {
 // (from `func init(wg *sync.WaitGroup) T`) receive this WG.  Not
 // part of the public API.
 //
-// Returns nil if the current goroutine has no identity block or the
-// phase has already closed.
+// Returns nil if the phase has already closed.  A missing identity
+// is fatal, matching the rest of the package's contract.
 func phaseWaitGroup() *sync.WaitGroup {
 	st := stateForCurrent()
 	if st == nil {
-		return nil
+		fatalMissingIdentity("phaseWaitGroup")
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -350,11 +395,11 @@ func phaseWaitGroup() *sync.WaitGroup {
 // invoked internally by SparkAs before its work function runs.  Not
 // part of the public API.
 //
-// Errors: ErrNoIdentity, errPhaseClosed.
+// Errors: errPhaseClosed.  A missing identity is fatal.
 func closePhase() error {
 	st := stateForCurrent()
 	if st == nil {
-		return ErrNoIdentity
+		fatalMissingIdentity("closePhase")
 	}
 	// Take the mutex briefly to check state, then release for Wait to
 	// avoid holding the mutex while background goroutines might want
@@ -377,15 +422,17 @@ func closePhase() error {
 }
 
 // CurrentSelf returns the current goroutine's Self.  Errors with
-// ErrPhaseOpen if the phase has not closed yet; errors with
-// ErrNoIdentity if the current goroutine has no identity block.
+// ErrPhaseOpen if the phase has not closed yet.  A missing identity
+// is fatal — the process terminates rather than returning an error,
+// since a missing identity means the runtime security invariant has
+// been violated.
 //
 // The returned Self's Traits slice is a fresh copy — callers may
 // mutate it freely without affecting the underlying state.
 func CurrentSelf() (Self, error) {
 	st := stateForCurrent()
 	if st == nil {
-		return Self{}, ErrNoIdentity
+		fatalMissingIdentity("CurrentSelf")
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -402,12 +449,13 @@ func CurrentSelf() (Self, error) {
 // traits; one filter matches Module; two filters match (Module,
 // Package).
 //
-// Errors: ErrNoIdentity, ErrPhaseOpen, ErrNotFound, ErrAmbiguous.
+// Errors: ErrPhaseOpen, ErrNotFound, ErrAmbiguous.  A missing
+// identity is fatal (see CurrentSelf).
 func TraitOf[T any](filters ...string) (T, error) {
 	var zero T
 	st := stateForCurrent()
 	if st == nil {
-		return zero, ErrNoIdentity
+		fatalMissingIdentity("TraitOf")
 	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -593,10 +641,10 @@ func SparkAs[TC any](
 	if err != nil {
 		return fmt.Errorf("genesis: SparkAs called on parent whose phase is not closed: %w", err)
 	}
-	runtime.Spark(func() {
+	runtimeJanosSpark(func() {
 		st := stateForCurrent()
 		if st == nil {
-			panic("genesis: SparkAs child has no identity block")
+			fatalMissingIdentity("SparkAs child")
 		}
 		// Inherit parent's traits under the mutex, then release for
 		// child inits to be able to registerTraitAny via the internal
@@ -645,7 +693,7 @@ func registerTraitAny(v any) error {
 	typ := reflect.TypeOf(v)
 	st := stateForCurrent()
 	if st == nil {
-		return ErrNoIdentity
+		fatalMissingIdentity("registerTraitAny")
 	}
 	module, pkg := callerOrigin()
 	st.mu.Lock()

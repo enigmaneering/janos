@@ -49,7 +49,7 @@ func TestIdentifyStableAcrossCalls(t *testing.T) {
 func TestSparkMintsDistinctIdentity(t *testing.T) {
 	me := runtime.Identify()
 	ch := make(chan runtime.Identity, 1)
-	runtime.Spark(func() { ch <- runtime.Identify() })
+	runtime.JanosSparkForTest(func() { ch <- runtime.Identify() })
 	sparked := <-ch
 	if sparked == me {
 		t.Fatal("Sparked Identity equals main's — mint did not fire")
@@ -66,7 +66,7 @@ func TestSparkNIndependentSparks(t *testing.T) {
 	const n = 32
 	ch := make(chan runtime.Identity, n)
 	for i := 0; i < n; i++ {
-		runtime.Spark(func() { ch <- runtime.Identify() })
+		runtime.JanosSparkForTest(func() { ch <- runtime.Identify() })
 	}
 	seen := make(map[uint64]bool)
 	for i := 0; i < n; i++ {
@@ -81,7 +81,7 @@ func TestSparkNIndependentSparks(t *testing.T) {
 func TestSparkGoDescendantsInheritSparkedIdentity(t *testing.T) {
 	sparkedCh := make(chan runtime.Identity, 1)
 	childCh := make(chan runtime.Identity, 1)
-	runtime.Spark(func() {
+	runtime.JanosSparkForTest(func() {
 		sparkedCh <- runtime.Identify()
 		go func() { childCh <- runtime.Identify() }()
 	})
@@ -134,7 +134,7 @@ func TestDeriveECDHTwoSparksAgree(t *testing.T) {
 	aSharedCh := make(chan []byte, 1)
 	bSharedCh := make(chan []byte, 1)
 
-	runtime.Spark(func() {
+	runtime.JanosSparkForTest(func() {
 		me := runtime.Identify()
 		aPubCh <- append([]byte(nil), me.PublicPoint[:]...)
 		peer := <-bPubCh
@@ -146,7 +146,7 @@ func TestDeriveECDHTwoSparksAgree(t *testing.T) {
 		}
 		aSharedCh <- shared
 	})
-	runtime.Spark(func() {
+	runtime.JanosSparkForTest(func() {
 		me := runtime.Identify()
 		bPubCh <- append([]byte(nil), me.PublicPoint[:]...)
 		peer := <-aPubCh
@@ -187,7 +187,7 @@ func TestDeriveEmptyIdentityRejected(t *testing.T) {
 
 func TestDeriveCrossGoroutineRejected(t *testing.T) {
 	ch := make(chan runtime.Identity, 1)
-	runtime.Spark(func() { ch <- runtime.Identify() })
+	runtime.JanosSparkForTest(func() { ch <- runtime.Identify() })
 	sparked := <-ch
 	_, err := sparked.Derive()
 	if err == nil {

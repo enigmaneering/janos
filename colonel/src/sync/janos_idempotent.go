@@ -8,7 +8,7 @@
 //
 // The identities are runtime.Identity values.  Two goroutines that
 // share an identity via `go` inheritance present identical Identity
-// values; a spark-child (from runtime.Spark) presents a distinct
+// values; a spark-child (from genesis.SparkAs) presents a distinct
 // Identity.  Callers who want "once per THIS goroutine" pass
 // runtime.Identify() explicitly; callers who want "once per
 // collection of peers" pass the participants' Identity values.

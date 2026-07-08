@@ -8,12 +8,12 @@
 //   - A private scalar d that never leaves the runtime.
 //
 // `go`-spawned children pointer-copy the parent's identityBlock — same
-// keys, same signatures, same Identity by ==.  runtime.Spark spawns a
-// child with a fresh identityBlock (new Index, new derived keys) —
-// this is the fundamental "certified ignition" primitive from which
-// all identity-fresh execution contexts descend.  A Glitter program's
-// `spark` entry point lowers to runtime.Spark for the standard-goroutine
-// path; compute-shader entry points and sparklet subprocesses follow
+// keys, same signatures, same Identity by ==.  runtime/genesis.SparkAs
+// spawns a child with a fresh identityBlock (new Index, new derived
+// keys) — this is the fundamental "certified ignition" primitive from
+// which all identity-fresh execution contexts descend.  A Glitter
+// program's `spark` entry point lowers to genesis.SparkAs for the
+// standard-goroutine path; compute-shader entry points and sparklet subprocesses follow
 // their own codepaths but are the same primitive at the identity
 // layer — every spark begins with a fresh derived identity.
 //
@@ -398,7 +398,7 @@ func Identify() Identity {
 	}
 }
 
-// Spark spawns f as a new goroutine with a fresh identity — the
+// janosSpark spawns f as a new goroutine with a fresh identity — the
 // fundamental "certified ignition" primitive from which all identity-
 // fresh execution contexts descend.  The parent's InstanceID is
 // recorded on the child's identityBlock; a fresh InstanceID is also
@@ -412,13 +412,18 @@ func Identify() Identity {
 // scope.
 //
 // Distinct from `go`: `go`-spawned goroutines share the parent's
-// identityBlock (equal Identity by ==); Spark-spawned goroutines mint
-// their own.  A Glitter program's `spark` entry point lowers to this
-// function for the standard goroutine path.  Compute-shader entry
-// points and sparklet subprocesses are "sparked" too, but follow
-// their own downstream codepaths for the actual execution — the
-// identity-mint step at the head of every spark is universal.
-func Spark(f func()) {
+// identityBlock (equal Identity by ==); spark-spawned goroutines mint
+// their own.  A Glitter program's `spark` entry point lowers to
+// runtime/genesis.SparkAs, which reaches this primitive via linkname.
+// User code has no direct access; the identity-mint step at the head
+// of every spark is universal but exposed only through the SparkAs
+// public API so a spawn cannot happen without genesis's phase
+// machinery being engaged.
+//
+// Do not change signature: used via linkname from runtime/genesis.
+//
+//go:linkname janosSpark
+func janosSpark(f func()) {
 	parentInstanceID := getg().provenance.instanceID
 	newBlock := janosMintIdentity(parentInstanceID)
 	freshIID := janosFreshInstanceID()
