@@ -139,3 +139,53 @@ func TestIdempotentCleanupOnBlockFinalization(t *testing.T) {
 			rounds, sparksPerRound, got, want)
 	}
 }
+
+// TestIdempotentEntriesEvictedOnBlockFinalization directly observes
+// the block-finalized hook draining the entries map.  The behavioral
+// cleanup test above cannot distinguish "entries evicted" from
+// "entries leaked but addresses never reused" — this one watches the
+// count itself.
+//
+// Two-phase convergence: sparked goroutines exit, but their g
+// descriptors sit on the scheduler's free list still holding
+// provenance pointers to the identity blocks.  Spawning waves of
+// plain goroutines recycles those g's (newproc1 overwrites their
+// provenance with the spawner's), dropping the last references so
+// GC can finalize the blocks and the hook can evict.
+func TestIdempotentEntriesEvictedOnBlockFinalization(t *testing.T) {
+	var idem sync.Idempotent
+	const n = 16
+	done := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		runtimeJanosSpark(func() {
+			idem.Do(func() {})
+			done <- struct{}{}
+		})
+	}
+	for i := 0; i < n; i++ {
+		<-done
+	}
+	// All n sparks registered; the test goroutine itself never called
+	// Do, so exactly n entries exist.
+	if got := sync.IdempotentEntryCountForTest(&idem); got != n {
+		t.Fatalf("after %d sparks, entries = %d, want %d", n, got, n)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for sync.IdempotentEntryCountForTest(&idem) > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("entries not evicted after 10s; %d remain — block-finalized hook broken?",
+				sync.IdempotentEntryCountForTest(&idem))
+		}
+		// Recycle dead g's so they release their identity blocks.
+		var wg sync.WaitGroup
+		for i := 0; i < 32; i++ {
+			wg.Add(1)
+			go func() { wg.Done() }()
+		}
+		wg.Wait()
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Converged to zero: every dead identity's slot was evicted.
+}
