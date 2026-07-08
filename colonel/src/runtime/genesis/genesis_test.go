@@ -33,7 +33,14 @@ func inSpark(t *testing.T, body func(*testing.T)) {
 type traitA struct{ value string }
 type traitB struct{ n int }
 type traitAlias = traitA
-type complexMain struct{ role string }
+type traitPrimary struct{ role string }
+
+// -- Internal-path tests ----------------------------------------------
+//
+// These call the unexported registerTrait / closePhase / phaseWaitGroup
+// helpers directly.  Register (the public API) can't be tested from a
+// test function because its mustBeInInitPhase guard panics outside
+// package init; those semantics are covered separately below.
 
 func TestRegisterTraitAndTraitOf(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
@@ -70,8 +77,6 @@ func TestRegisterTraitTypeAliasesCollide(t *testing.T) {
 		if err := registerTrait(traitA{value: "concrete"}); err != nil {
 			t.Fatalf("first registerTrait: %v", err)
 		}
-		// traitAlias is a type alias for traitA — reflect treats them
-		// as the same reflect.Type, so registration must be rejected.
 		err := registerTrait(traitAlias{value: "alias"})
 		if !errors.Is(err, errDuplicateType) {
 			t.Fatalf("alias registerTrait: expected errDuplicateType, got %v", err)
@@ -112,7 +117,6 @@ func TestTraitOfBeforeCloseErrsPhaseOpen(t *testing.T) {
 		if err := registerTrait(traitA{value: "hi"}); err != nil {
 			t.Fatalf("registerTrait: %v", err)
 		}
-		// Deliberately do not close.
 		_, err := TraitOf[traitA]()
 		if !errors.Is(err, ErrPhaseOpen) {
 			t.Fatalf("TraitOf before close: expected ErrPhaseOpen, got %v", err)
@@ -155,7 +159,6 @@ func TestTraitOfModuleFilter(t *testing.T) {
 		if err := closePhase(); err != nil {
 			t.Fatalf("closePhase: %v", err)
 		}
-		// Non-matching filter — must reject.
 		_, err := TraitOf[traitA]("nonexistent/module")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("non-matching filter: expected ErrNotFound, got %v", err)
@@ -175,64 +178,25 @@ func TestClosePhaseTwiceErrs(t *testing.T) {
 	})
 }
 
-func TestSetComplexAndCurrentSelf(t *testing.T) {
+func TestSparkAsInheritsAndPrimaryFlowsToWork(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
-		if err := setComplex(complexMain{role: "controller"}); err != nil {
-			t.Fatalf("setComplex: %v", err)
-		}
-		if err := closePhase(); err != nil {
-			t.Fatalf("closePhase: %v", err)
-		}
-		self, err := CurrentSelf()
-		if err != nil {
-			t.Fatalf("CurrentSelf: %v", err)
-		}
-		cm, ok := self.Complex.(complexMain)
-		if !ok {
-			t.Fatalf("Self.Complex = %#v, want complexMain", self.Complex)
-		}
-		if cm.role != "controller" {
-			t.Errorf("Self.Complex.role = %q, want %q", cm.role, "controller")
-		}
-	})
-}
-
-func TestSetComplexTwiceErrs(t *testing.T) {
-	inSpark(t, func(t *testing.T) {
-		if err := setComplex(complexMain{role: "a"}); err != nil {
-			t.Fatalf("first setComplex: %v", err)
-		}
-		err := setComplex(complexMain{role: "b"})
-		if !errors.Is(err, errComplexAlreadySet) {
-			t.Fatalf("second setComplex: expected errComplexAlreadySet, got %v", err)
-		}
-	})
-}
-
-func TestSparkAsInheritsTraitsAndSetsFreshComplex(t *testing.T) {
-	inSpark(t, func(t *testing.T) {
-		// Parent side: register a trait, close.
 		if err := registerTrait(traitA{value: "from-parent"}); err != nil {
 			t.Fatalf("parent registerTrait: %v", err)
-		}
-		if err := setComplex(complexMain{role: "parent"}); err != nil {
-			t.Fatalf("parent setComplex: %v", err)
 		}
 		if err := closePhase(); err != nil {
 			t.Fatalf("parent closePhase: %v", err)
 		}
 
-		// Spark a child that adds its own Trait and gets a fresh Complex.
 		var (
-			childComplex atomic.Pointer[complexMain]
-			childTraitA  atomic.Pointer[traitA]
-			childTraitB  atomic.Pointer[traitB]
-			done         = make(chan struct{})
+			primaryReceived atomic.Pointer[traitPrimary]
+			inheritedA      atomic.Pointer[traitA]
+			addedB          atomic.Pointer[traitB]
+			done            = make(chan struct{})
 		)
 		err := SparkAs(
-			func(c complexMain) {
+			func(p traitPrimary) {
 				defer close(done)
-				childComplex.Store(&c)
+				primaryReceived.Store(&p)
 				a, aErr := TraitOf[traitA]()
 				if aErr != nil {
 					t.Errorf("child TraitOf[A]: %v", aErr)
@@ -243,40 +207,36 @@ func TestSparkAsInheritsTraitsAndSetsFreshComplex(t *testing.T) {
 					t.Errorf("child TraitOf[B]: %v", bErr)
 					return
 				}
-				childTraitA.Store(&a)
-				childTraitB.Store(&b)
+				inheritedA.Store(&a)
+				addedB.Store(&b)
 			},
-			func() complexMain { return complexMain{role: "child"} },
+			func() traitPrimary { return traitPrimary{role: "child"} },
 			func() any { return traitB{n: 7} },
 		)
 		if err != nil {
 			t.Fatalf("SparkAs: %v", err)
 		}
 		<-done
-		cc := childComplex.Load()
-		if cc == nil {
-			t.Fatal("child Complex was never captured")
+		p := primaryReceived.Load()
+		if p == nil || p.role != "child" {
+			t.Errorf("primary received = %v, want role=child", p)
 		}
-		if cc.role != "child" {
-			t.Errorf("child Complex.role = %q, want %q", cc.role, "child")
+		a := inheritedA.Load()
+		if a == nil || a.value != "from-parent" {
+			t.Errorf("inherited traitA = %v, want value=from-parent", a)
 		}
-		ca := childTraitA.Load()
-		if ca == nil || ca.value != "from-parent" {
-			t.Errorf("child inherited traitA = %v, want value=from-parent", ca)
-		}
-		cb := childTraitB.Load()
-		if cb == nil || cb.n != 7 {
-			t.Errorf("child own traitB = %v, want n=7", cb)
+		b := addedB.Load()
+		if b == nil || b.n != 7 {
+			t.Errorf("added traitB = %v, want n=7", b)
 		}
 	})
 }
 
 func TestSparkAsRequiresParentPhaseClosed(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
-		// Parent has NOT closed phase.
 		err := SparkAs(
-			func(c complexMain) {},
-			func() complexMain { return complexMain{role: "child"} },
+			func(p traitPrimary) {},
+			func() traitPrimary { return traitPrimary{role: "child"} },
 		)
 		if !errors.Is(err, ErrPhaseOpen) {
 			t.Fatalf("SparkAs before parent close: expected ErrPhaseOpen, got %v", err)
@@ -287,12 +247,11 @@ func TestSparkAsRequiresParentPhaseClosed(t *testing.T) {
 // SparkAs propagates a child-side registration collision by panicking
 // on the child goroutine.  A panic on that goroutine tears down the
 // test binary — Go's testing framework cannot recover it — so we
-// don't test the panic directly here.  The behaviour is covered by
-// composition: TestRegisterTraitDuplicateType proves the collision
-// check fires, and TestSparkAsInheritsTraitsAndSetsFreshComplex
-// proves inheritance populates the child's typeIdx before the child's
-// own initializers run, so any inherited-vs-local collision goes
-// through the same tested path.
+// don't test the panic directly here.  Coverage comes from composition:
+// TestRegisterTraitDuplicateType proves the collision check fires,
+// and TestSparkAsInheritsAndPrimaryFlowsToWork proves inheritance
+// populates the child's typeIdx before the child's own initializers
+// run.
 
 func TestPhaseWaitGroupHoldsCloseUntilDone(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
@@ -307,10 +266,6 @@ func TestPhaseWaitGroupHoldsCloseUntilDone(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			time.Sleep(50 * time.Millisecond)
-			// Register a trait from the async goroutine.  Because
-			// the runtime goroutine minting this trait is a plain
-			// `go` (not a Spark), it inherits the parent identity and
-			// therefore registers into the same selfState.
 			if err := registerTrait(traitB{n: 99}); err != nil {
 				t.Errorf("async registerTrait: %v", err)
 			}
@@ -319,7 +274,6 @@ func TestPhaseWaitGroupHoldsCloseUntilDone(t *testing.T) {
 			mu.Unlock()
 		}()
 
-		// closePhase must block until the goroutine's Done() fires.
 		start := time.Now()
 		if err := closePhase(); err != nil {
 			t.Fatalf("closePhase: %v", err)
@@ -335,7 +289,6 @@ func TestPhaseWaitGroupHoldsCloseUntilDone(t *testing.T) {
 			t.Fatal("async goroutine did not mark trait registration before closePhase returned")
 		}
 
-		// TraitOf now sees the async trait.
 		got, err := TraitOf[traitB]()
 		if err != nil {
 			t.Fatalf("TraitOf B: %v", err)
@@ -373,141 +326,143 @@ func TestTraitOfEmptySelf(t *testing.T) {
 		if len(self.Traits) != 0 {
 			t.Errorf("empty Self.Traits length = %d, want 0", len(self.Traits))
 		}
-		if self.Complex != nil {
-			t.Errorf("empty Self.Complex = %v, want nil", self.Complex)
-		}
 	})
 }
 
-// -- Public API tests -------------------------------------------------
+// -- Register dispatch tests -----------------------------------------
 
-type traitPublic struct{ tag string }
-type traitPublicAsync struct{ ready bool }
-type complexPublic struct{ mode string }
+type registerValueTrait struct{ tag string }
+type registerFuncTrait struct{ n int }
+type registerAsyncTrait struct{ ready bool }
 
-func TestRegisterPublic(t *testing.T) {
+func TestRegisterDispatchPlainValue(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
-		got := Register(func() traitPublic { return traitPublic{tag: "reg"} })
-		if got.tag != "reg" {
-			t.Errorf("Register return = %q, want %q", got.tag, "reg")
+		out := registerDispatch(registerValueTrait{tag: "direct"})
+		v, ok := out.(registerValueTrait)
+		if !ok || v.tag != "direct" {
+			t.Errorf("registerDispatch return = %v, want registerValueTrait{tag:direct}", out)
 		}
 		if err := closePhase(); err != nil {
 			t.Fatalf("closePhase: %v", err)
 		}
-		back, err := TraitOf[traitPublic]()
+		back, err := TraitOf[registerValueTrait]()
 		if err != nil {
 			t.Fatalf("TraitOf: %v", err)
 		}
-		if back.tag != "reg" {
-			t.Errorf("TraitOf return = %q, want %q", back.tag, "reg")
+		if back.tag != "direct" {
+			t.Errorf("TraitOf = %v, want tag=direct", back)
 		}
 	})
 }
 
-func TestSetMainComplexPublic(t *testing.T) {
+func TestRegisterDispatchSyncFunc(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
-		got := SetMainComplex(func() complexPublic { return complexPublic{mode: "app"} })
-		if got.mode != "app" {
-			t.Errorf("SetMainComplex return = %q, want %q", got.mode, "app")
+		out := registerDispatch(func() registerFuncTrait { return registerFuncTrait{n: 3} })
+		v, ok := out.(registerFuncTrait)
+		if !ok || v.n != 3 {
+			t.Errorf("registerDispatch return = %v, want registerFuncTrait{n:3}", out)
 		}
 		if err := closePhase(); err != nil {
 			t.Fatalf("closePhase: %v", err)
 		}
-		self, err := CurrentSelf()
+		back, err := TraitOf[registerFuncTrait]()
 		if err != nil {
-			t.Fatalf("CurrentSelf: %v", err)
+			t.Fatalf("TraitOf: %v", err)
 		}
-		cm, ok := self.Complex.(complexPublic)
-		if !ok || cm.mode != "app" {
-			t.Errorf("Self.Complex = %#v, want complexPublic{mode:app}", self.Complex)
+		if back.n != 3 {
+			t.Errorf("TraitOf = %v, want n=3", back)
 		}
 	})
 }
 
-func TestRegisterAsyncPublicHoldsPhase(t *testing.T) {
+func TestRegisterDispatchAsyncFunc(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
 		var completed atomic.Bool
-		got := RegisterAsync(func(wg *sync.WaitGroup) traitPublicAsync {
-			t := traitPublicAsync{}
+		out := registerDispatch(func(wg *sync.WaitGroup) registerAsyncTrait {
+			r := registerAsyncTrait{}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				time.Sleep(50 * time.Millisecond)
-				t.ready = true // mutated locally, not observable via TraitOf
 				completed.Store(true)
 			}()
-			return t
+			return r
 		})
-		// The returned value is what's registered — the async work
-		// completes later.  RegisterAsync should not block.
-		_ = got
+		if _, ok := out.(registerAsyncTrait); !ok {
+			t.Errorf("registerDispatch return = %v, want registerAsyncTrait", out)
+		}
 		start := time.Now()
 		if err := closePhase(); err != nil {
 			t.Fatalf("closePhase: %v", err)
 		}
-		elapsed := time.Since(start)
-		if elapsed < 40*time.Millisecond {
-			t.Errorf("closePhase returned in %v — expected to wait ~50ms for async", elapsed)
+		if time.Since(start) < 40*time.Millisecond {
+			t.Errorf("closePhase returned too quickly (async work not awaited)")
 		}
 		if !completed.Load() {
-			t.Error("async goroutine did not complete before closePhase returned")
+			t.Error("async work did not complete before closePhase returned")
 		}
 	})
 }
 
-func TestRegisterDuplicatePanics(t *testing.T) {
+func TestRegisterDispatchUnsupportedFunctionPanics(t *testing.T) {
 	inSpark(t, func(t *testing.T) {
-		Register(func() traitPublic { return traitPublic{tag: "first"} })
 		defer func() {
 			r := recover()
 			if r == nil {
-				t.Fatal("expected panic on duplicate Register, got clean return")
-			}
-			// panic value should be an error wrapping errDuplicateType.
-			if err, ok := r.(error); !ok || !errors.Is(err, errDuplicateType) {
-				t.Errorf("panic value = %v, want an error wrapping errDuplicateType", r)
+				t.Fatal("expected panic on unsupported function shape")
 			}
 		}()
-		Register(func() traitPublic { return traitPublic{tag: "second"} })
+		// Multi-return: not sync init and not async init.
+		registerDispatch(func() (int, error) { return 0, nil })
 	})
 }
 
-// TestMainPhaseClosedAtTestStart verifies that runtime.main's genesis
-// close hook fired before this test runs.  We don't wrap in inSpark:
-// the test's outer goroutine inherits main's identity via `go`, so it
-// shares main's selfState — which should already be frozen.
+func TestRegisterDispatchNilPanics(t *testing.T) {
+	inSpark(t, func(t *testing.T) {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic on nil argument")
+			}
+		}()
+		registerDispatch(nil)
+	})
+}
+
+// TestRegisterOutsideInitPanics verifies the mustBeInInitPhase guard
+// on Register — calling Register from a test function (not under
+// runtime.doInit) MUST panic.  This is JanOS's runtime enforcement
+// that Register lives only in package-init scope.
+func TestRegisterOutsideInitPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic when Register is called outside package init")
+		}
+		msg, _ := r.(string)
+		if err, ok := r.(error); ok {
+			msg = err.Error()
+		}
+		if msg == "" {
+			t.Errorf("panic value has no error message: %#v", r)
+		}
+	}()
+	Register(registerValueTrait{tag: "should not reach"})
+}
+
+// -- Main-init-done hook --------------------------------------------
+
+// TestMainPhaseClosedAtTestStart verifies runtime.main's genesis
+// close hook fired before any test runs.  The test's outer goroutine
+// inherits main's identity via `go`, so it shares main's selfState —
+// which should already be frozen by the time tests execute.
 func TestMainPhaseClosedAtTestStart(t *testing.T) {
 	_, err := CurrentSelf()
 	if err != nil {
 		t.Fatalf("main goroutine's phase should be closed at test start, got: %v", err)
 	}
-	// RegisterTrait on a frozen phase must error.
-	err = registerTrait(traitPublic{tag: "post-hook"})
+	err = registerTrait(traitA{value: "post-hook"})
 	if !errors.Is(err, errPhaseClosed) {
 		t.Errorf("registerTrait on frozen main: expected errPhaseClosed, got %v", err)
 	}
-}
-
-// TestGenesisBridgeInstalled verifies runtime/genesis actually
-// registered the phase-close hook with the runtime.  The bridge is
-// covered indirectly by TestMainPhaseClosedAtTestStart, but this test
-// asserts the installation happens at package-init time.  It runs
-// even earlier than most tests but the whole test binary has already
-// gone through package init by the time any test runs, so we're
-// verifying "after init, the hook must have fired" — same as the
-// other test, just documenting intent.
-func TestGenesisBridgeInstalled(t *testing.T) {
-	// If the hook installation had been skipped, main's phase would
-	// still be open and any subsequent test using inSpark would work
-	// on the child but CurrentSelf() on the outer test goroutine
-	// would fail.  The success of TestMainPhaseClosedAtTestStart
-	// implies the bridge is in place.  Verify explicitly too:
-	self, err := CurrentSelf()
-	if err != nil {
-		t.Fatalf("CurrentSelf on main-identity test goroutine: %v", err)
-	}
-	// We don't assert anything about the Traits contents — the test
-	// binary doesn't register any.  We just verify the frozen Self
-	// is observable, which is the load-bearing property.
-	_ = self
 }

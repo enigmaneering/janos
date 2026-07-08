@@ -14,42 +14,41 @@
 //
 // # Public API
 //
-// Registration:
-//
-//   - Register[T](func() T) T — contribute a Trait; idiomatic use is
-//     `var _ = genesis.Register(func() T { ... })` at package scope.
-//   - SetMainComplex[T](func() T) T — set the primary Complex; only
-//     the main package should call this.
-//   - RegisterAsync[T](func(*sync.WaitGroup) T) T — like Register but
-//     the init function receives the phase's WaitGroup for background
-//     work.  The phase does not close until all Add-ed work drains.
-//
-// Query and spawning:
-//
+//   - Register(any) any — contribute a Trait.  Idiomatic use is
+//     `var Bus = genesis.Register(func() *Bus { ... }).(*Bus)` at
+//     package scope.  Register accepts one of three shapes and
+//     dispatches at runtime:
+//   - a plain value T                  → registered directly
+//   - a function `func() T`            → invoked, result registered
+//   - `func(*sync.WaitGroup) T`        → invoked with the phase WG,
+//     result registered (async init)
+//     Register MUST be called during package init — an invocation
+//     from any other scope panics loudly with a message describing
+//     the required pattern.
 //   - TraitOf[T](filters ...string) — query a trait by type,
 //     optionally narrowed by module and/or package.
-//   - CurrentSelf() — read the assembled Self.
+//   - CurrentSelf() — read the assembled Self (the frozen bag of
+//     Traits for this goroutine's identity).
 //   - SparkAs[TC] — spawn a fresh-identity goroutine with its own
-//     genesis phase.
+//     genesis phase; the primary init produces the value that the
+//     child's work function receives directly.
 //
 // The runtime automatically closes the main goroutine's phase after
-// package init completes, before main.main runs.  Users never invoke
-// the close explicitly for the top-level phase; SparkAs handles the
-// close for child phases internally.
+// package init completes and before main.main runs.  Users never
+// invoke the close explicitly for the top-level phase; SparkAs
+// handles the close for child phases internally.
 //
 // # Language integration
 //
-// In the intended shape of the JanOS/Glitter stack, the Register /
-// SetMainComplex / RegisterAsync surface is what the Glitter compiler
-// lowers to when user code writes:
+// In the intended shape of the JanOS/Glitter stack, Register is what
+// the Glitter compiler lowers to when user source writes any of:
 //
-//	func init() T                        // Register
-//	func init() T             in main    // SetMainComplex
-//	func init(wg *sync.WaitGroup) T      // RegisterAsync
+//	func init() T
+//	func init(wg *sync.WaitGroup) T
 //
-// The runtime substrate does not require compiler surgery — Glitter
-// carries the ergonomic weight of the source syntax and emits plain
-// Go that JanOS runs.
+// The runtime substrate takes no compiler surgery — Glitter carries
+// the ergonomic weight of the source syntax and emits plain Go that
+// JanOS runs.
 //
 // # Atomic-on-open
 //
@@ -92,12 +91,12 @@ type Trait struct {
 	Complex any
 }
 
-// Self is a running spark's classified execution surface: a top-level
-// Complex (typed as any at this layer; recovered by callers when they
-// know the concrete type) and a set of orthogonal Traits.
+// Self is a running spark's classified execution surface: a bag of
+// Traits, each classified by the type of its Complex.  Main's
+// contribution appears as one of the Traits (Package == "main");
+// downstream code can find it via TraitOf[T](...) or by filter.
 type Self struct {
-	Complex any
-	Traits  []Trait
+	Traits []Trait
 }
 
 // Sentinel errors returned by the public API.
@@ -121,12 +120,11 @@ var (
 )
 
 // Internal-only sentinel errors.  Surface through panics from
-// compiler-emitted code (or SparkAs's child) when the invariants
-// they guard are violated.
+// Register or SparkAs's child when the invariants they guard are
+// violated.
 var (
-	errPhaseClosed       = errors.New("genesis: phase already closed; Self is frozen")
-	errDuplicateType     = errors.New("genesis: trait type already registered on this identity")
-	errComplexAlreadySet = errors.New("genesis: Complex already set on this identity")
+	errPhaseClosed   = errors.New("genesis: phase already closed; Self is frozen")
+	errDuplicateType = errors.New("genesis: trait type already registered on this identity")
 )
 
 // selfState is the internal per-identity backing of a Self.  One
@@ -134,9 +132,8 @@ var (
 // SparkAs children get a fresh one.  Registry keys are identityBlock
 // addresses (obtained via linkname to runtime.janosIdentityBlockAddr).
 type selfState struct {
-	mu      sync.Mutex
-	complex any
-	traits  []Trait
+	mu     sync.Mutex
+	traits []Trait
 	// typeIdx maps reflect.Type -> index into traits, for O(1)
 	// uniqueness check and TraitOf lookup.
 	typeIdx map[reflect.Type]int
@@ -144,12 +141,8 @@ type selfState struct {
 	// on it; closePhase waits on it before freezing.
 	wg sync.WaitGroup
 	// frozen flips true when closePhase completes.  After that,
-	// TraitOf and CurrentSelf answer; registerTrait and setComplex
-	// refuse.
+	// TraitOf and CurrentSelf answer; registerTrait refuses.
 	frozen bool
-	// complexSet distinguishes "setComplex explicitly called" from
-	// "complex is still the zero value".
-	complexSet bool
 }
 
 // registry maps identityBlock address -> selfState.  Populated
@@ -331,30 +324,6 @@ func registerTrait[T any](t T) error {
 	return nil
 }
 
-// setComplex records t as the primary Complex of the current
-// goroutine's Self.  For a main goroutine this is emitted by the
-// compiler from the main package's typed init; for a SparkAs child
-// SparkAs invokes it directly.  Not part of the public API.
-//
-// Errors: ErrNoIdentity, errPhaseClosed, errComplexAlreadySet.
-func setComplex[T any](t T) error {
-	st := stateForCurrent()
-	if st == nil {
-		return ErrNoIdentity
-	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	if st.frozen {
-		return errPhaseClosed
-	}
-	if st.complexSet {
-		return errComplexAlreadySet
-	}
-	st.complex = t
-	st.complexSet = true
-	return nil
-}
-
 // phaseWaitGroup returns the *sync.WaitGroup for the current
 // identity's genesis phase.  Compiler-emitted async initializers
 // (from `func init(wg *sync.WaitGroup) T`) receive this WG.  Not
@@ -425,7 +394,7 @@ func CurrentSelf() (Self, error) {
 	}
 	traits := make([]Trait, len(st.traits))
 	copy(traits, st.traits)
-	return Self{Complex: st.complex, Traits: traits}, nil
+	return Self{Traits: traits}, nil
 }
 
 // TraitOf returns the Trait of type T from the current goroutine's
@@ -476,130 +445,149 @@ func TraitOf[T any](filters ...string) (T, error) {
 	return st.traits[matchedIdx].Complex.(T), nil
 }
 
-// Register runs init immediately, contributes the result as a Trait
-// on the current goroutine's Self, and returns the same value so it
-// can be captured by the caller.
-//
-// The idiomatic use is a package-level variable initializer, which
-// Go invokes during package init in dependency-topological order:
-//
-//	package pwm
-//
-//	var Bus = genesis.Register(func() *Bus {
-//	    return &Bus{...}
-//	})
-//
-// Register panics on any registration error (identity missing,
-// phase already closed, duplicate type on this identity).  These
-// conditions represent program bugs — silently ignoring them would
-// leave Self malformed — so the program terminates loudly.
-//
-// This function replaces what a `func init() T` signature would
-// express with compiler support.  When Glitter emits its lowering
-// to Go, it produces the equivalent Register call.
-func Register[T any](init func() T) T {
-	v := init()
-	if err := registerTrait(v); err != nil {
-		panic(fmt.Errorf("genesis: Register failed: %w", err))
-	}
-	return v
-}
+// waitGroupType is the reflect.Type of *sync.WaitGroup, precomputed
+// once for use by Register's function-shape dispatch.
+var waitGroupType = reflect.TypeOf((*sync.WaitGroup)(nil))
 
-// SetMainComplex runs init immediately, records the result as the
-// primary Complex of the main goroutine's Self, and returns the same
-// value so it can be captured by the caller.
+// Register contributes something to the current goroutine's Self and
+// returns the registered value as any.  The caller casts back to the
+// concrete type at the callsite:
 //
-// The idiomatic use is in the main package:
-//
-//	package main
-//
-//	var Self = genesis.SetMainComplex(func() *App {
-//	    return &App{...}
-//	})
-//
-// SetMainComplex panics on any error (identity missing, phase
-// already closed, Complex already set on this identity).  Only the
-// main package should call this — a non-main package that does so
-// will race with main's contribution and produce ErrComplexAlreadySet.
-//
-// This function replaces what a `func init() T` in the main package
-// would express with compiler support.
-func SetMainComplex[T any](init func() T) T {
-	v := init()
-	if err := setComplex(v); err != nil {
-		panic(fmt.Errorf("genesis: SetMainComplex failed: %w", err))
-	}
-	return v
-}
-
-// RegisterAsync runs init immediately, passing the current genesis
-// phase's *sync.WaitGroup, contributes init's return as a Trait, and
-// returns the same value so it can be captured.  The caller decides
-// what background work to attach to the WaitGroup — the phase does
-// not close until every wg.Add is matched by a wg.Done.
-//
-// The idiomatic use, in a package that needs to do slow init work
-// without blocking the whole genesis phase:
-//
-//	package hardware
-//
-//	var Radio = genesis.RegisterAsync(func(wg *sync.WaitGroup) *Radio {
+//	var Bus = genesis.Register(func() *Bus { return &Bus{...} }).(*Bus)
+//	var App = genesis.Register(func() *App { return &App{...} }).(*App)
+//	var Radio = genesis.Register(func(wg *sync.WaitGroup) *Radio {
 //	    r := &Radio{}
 //	    wg.Add(1)
-//	    go func() {
-//	        defer wg.Done()
-//	        r.Calibrate()  // takes 200ms
-//	    }()
+//	    go func() { defer wg.Done(); r.Calibrate() }()
 //	    return r
-//	})
+//	}).(*Radio)
 //
-// The returned Radio is immediately visible in Self (once the phase
-// closes), but the caller can rely on Self opening only after all
-// async work has drained.
+// Register dispatches at runtime based on what it receives:
 //
-// Panics on registration errors, same as Register.
+//   - A function `func() T` — invoked; result registered as a Trait.
+//   - `func(*sync.WaitGroup) T` — invoked with the phase's WaitGroup;
+//     result registered.  Async work Add-ed to the WG holds the
+//     phase open until Done fires.
+//   - Any other value — registered directly as a Trait.
 //
-// This function replaces what a `func init(wg *sync.WaitGroup) T`
-// signature would express with compiler support.
-func RegisterAsync[T any](init func(*sync.WaitGroup) T) T {
-	wg := phaseWaitGroup()
-	if wg == nil {
-		panic(fmt.Errorf("genesis: RegisterAsync called with no active phase (already closed?)"))
+// Functions with unsupported shapes (multiple returns, non-WG
+// arguments, no return) panic with a descriptive message rather
+// than being silently registered as function-valued traits.
+//
+// Register MUST be called during package init.  Invoking it from
+// anywhere else — main.main, a spawned goroutine at runtime, a
+// SparkAs work function — panics loudly with a message describing
+// the required `var _ = genesis.Register(...)` at package-scope
+// pattern.  A misused Register would leave Self malformed or
+// silently drop contributions, which is worse than a boot-time
+// crash.
+//
+// In the JanOS/Glitter stack, Register is what the Glitter compiler
+// lowers to when user source writes `func init() T` or
+// `func init(wg *sync.WaitGroup) T`.  Direct use in Go is supported
+// but Glitter-authored code produces the same calls.
+func Register(thing any) any {
+	mustBeInInitPhase()
+	return registerDispatch(thing)
+}
+
+// registerDispatch is Register's implementation without the
+// init-scope check.  Extracted so tests can exercise the dispatch
+// logic directly — Register itself always errors from a test
+// goroutine because tests never run under runtime.doInit.
+func registerDispatch(thing any) any {
+	if thing == nil {
+		panic("genesis.Register: nil argument")
 	}
-	v := init(wg)
-	if err := registerTrait(v); err != nil {
-		panic(fmt.Errorf("genesis: RegisterAsync failed: %w", err))
+	rv := reflect.ValueOf(thing)
+	if rv.Kind() != reflect.Func {
+		return registerValue(thing)
+	}
+	rft := rv.Type()
+	switch {
+	case rft.NumIn() == 0 && rft.NumOut() == 1:
+		out := rv.Call(nil)
+		return registerValue(out[0].Interface())
+	case rft.NumIn() == 1 && rft.NumOut() == 1 && rft.In(0) == waitGroupType:
+		wg := phaseWaitGroup()
+		if wg == nil {
+			panic("genesis.Register: no active phase; caller does not hold an open genesis phase")
+		}
+		out := rv.Call([]reflect.Value{reflect.ValueOf(wg)})
+		return registerValue(out[0].Interface())
+	default:
+		panic(fmt.Errorf("genesis.Register: unsupported function shape %s — must be func() T or func(*sync.WaitGroup) T", rft))
+	}
+}
+
+// registerValue is the shared tail of Register (and SparkAs's
+// child-side init) that stores an any as a Trait and panics on
+// error.  Any registration error is a program bug at genesis time.
+func registerValue(v any) any {
+	if err := registerTraitAny(v); err != nil {
+		panic(fmt.Errorf("genesis.Register: %w", err))
 	}
 	return v
+}
+
+// mustBeInInitPhase walks the current goroutine's call stack looking
+// for runtime.doInit or runtime.doInit1.  If neither is an ancestor
+// frame the call is not inside a package init sequence and Register
+// panics.  This is JanOS's guardrail against Register drifting into
+// runtime contexts where the phase machinery is either closed or
+// meaningless.
+func mustBeInInitPhase() {
+	var pcs [64]uintptr
+	n := runtime.Callers(2, pcs[:])
+	if n == 0 {
+		panic("genesis.Register: unable to inspect call stack")
+	}
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		f, more := frames.Next()
+		if f.Function == "runtime.doInit1" || f.Function == "runtime.doInit" {
+			return
+		}
+		if !more {
+			break
+		}
+	}
+	panic("genesis.Register: must be called during package init — use `var _ = genesis.Register(...)` at package scope")
 }
 
 // SparkAs spawns a fresh-identity goroutine, runs a genesis phase on
-// it, and then invokes work with the resulting Complex.
+// it, and then invokes work with the value produced by primaryInit.
 //
 // Genesis on the child:
 //
 //  1. The parent's Traits are inherited verbatim (parent must have
 //     closed its phase; otherwise ErrPhaseOpen is returned).
-//  2. complexInit runs on the child and its result becomes Self.Complex.
-//  3. Each function in traitInits runs on the child; its result is
-//     registered as a Trait (type-erased through the variadic; the
-//     runtime uses reflect to derive type identity for uniqueness).
+//  2. primaryInit runs on the child; its result is registered as a
+//     Trait and also carried forward to work.
+//  3. Each function in additionalInits runs on the child; its result
+//     is registered as a Trait (type-erased through the variadic).
 //  4. The child's phase closes.
-//  5. work runs on the child with the freshly-produced Complex.
+//  5. work runs on the child with primaryInit's return value.
 //
-// A Trait registered by a traitInit whose type collides with an
-// inherited Trait panics on the child — child code cannot silently
-// override an inherited classification.
+// The primary trait is what distinguishes this Spark's role at
+// compile time: work's argument type TC is inferred from primaryInit's
+// return type, so the caller gets full typing on the value it acts
+// on.  Additional inits contribute traits alongside the primary; all
+// go into the same per-identity Self.
+//
+// A trait registered by an additionalInit whose type collides with
+// an inherited trait panics on the child — child code cannot
+// silently override an inherited classification.
 func SparkAs[TC any](
 	work func(TC),
-	complexInit func() TC,
-	traitInits ...func() any,
+	primaryInit func() TC,
+	additionalInits ...func() any,
 ) error {
 	if work == nil {
 		return errors.New("genesis: SparkAs work function is nil")
 	}
-	if complexInit == nil {
-		return errors.New("genesis: SparkAs complexInit is nil")
+	if primaryInit == nil {
+		return errors.New("genesis: SparkAs primaryInit is nil")
 	}
 	parentSelf, err := CurrentSelf()
 	if err != nil {
@@ -611,7 +599,7 @@ func SparkAs[TC any](
 			panic("genesis: SparkAs child has no identity block")
 		}
 		// Inherit parent's traits under the mutex, then release for
-		// user init to be able to registerTrait via the internal
+		// child inits to be able to registerTraitAny via the internal
 		// helper.
 		st.mu.Lock()
 		for _, tr := range parentSelf.Traits {
@@ -621,26 +609,28 @@ func SparkAs[TC any](
 		}
 		st.mu.Unlock()
 
-		// Complex is the child's own — call complexInit on the child
-		// so it can observe the child's identity if it wants.
-		c := complexInit()
-		if err := setComplex(c); err != nil {
-			panic(fmt.Errorf("genesis: SparkAs setComplex failed: %w", err))
+		// Primary: the child's own top-of-its-Self trait — call on
+		// the child so it can observe the child's identity if it
+		// wants.  Registered like any other trait.
+		primary := primaryInit()
+		if err := registerTraitAny(primary); err != nil {
+			panic(fmt.Errorf("genesis: SparkAs primaryInit failed: %w", err))
 		}
-		// Trait initializers.  Type-erased through the variadic.
-		for i, init := range traitInits {
+		// Additional trait initializers.  Type-erased through the
+		// variadic.
+		for i, init := range additionalInits {
 			if init == nil {
-				panic(fmt.Errorf("genesis: SparkAs traitInit[%d] is nil", i))
+				panic(fmt.Errorf("genesis: SparkAs additionalInits[%d] is nil", i))
 			}
 			v := init()
 			if err := registerTraitAny(v); err != nil {
-				panic(fmt.Errorf("genesis: SparkAs traitInit[%d] failed: %w", i, err))
+				panic(fmt.Errorf("genesis: SparkAs additionalInits[%d] failed: %w", i, err))
 			}
 		}
 		if err := closePhase(); err != nil {
 			panic(fmt.Errorf("genesis: SparkAs closePhase failed: %w", err))
 		}
-		work(c)
+		work(primary)
 	})
 	return nil
 }
