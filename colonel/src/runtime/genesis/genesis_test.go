@@ -378,3 +378,136 @@ func TestTraitOfEmptySelf(t *testing.T) {
 		}
 	})
 }
+
+// -- Public API tests -------------------------------------------------
+
+type traitPublic struct{ tag string }
+type traitPublicAsync struct{ ready bool }
+type complexPublic struct{ mode string }
+
+func TestRegisterPublic(t *testing.T) {
+	inSpark(t, func(t *testing.T) {
+		got := Register(func() traitPublic { return traitPublic{tag: "reg"} })
+		if got.tag != "reg" {
+			t.Errorf("Register return = %q, want %q", got.tag, "reg")
+		}
+		if err := closePhase(); err != nil {
+			t.Fatalf("closePhase: %v", err)
+		}
+		back, err := TraitOf[traitPublic]()
+		if err != nil {
+			t.Fatalf("TraitOf: %v", err)
+		}
+		if back.tag != "reg" {
+			t.Errorf("TraitOf return = %q, want %q", back.tag, "reg")
+		}
+	})
+}
+
+func TestSetMainComplexPublic(t *testing.T) {
+	inSpark(t, func(t *testing.T) {
+		got := SetMainComplex(func() complexPublic { return complexPublic{mode: "app"} })
+		if got.mode != "app" {
+			t.Errorf("SetMainComplex return = %q, want %q", got.mode, "app")
+		}
+		if err := closePhase(); err != nil {
+			t.Fatalf("closePhase: %v", err)
+		}
+		self, err := CurrentSelf()
+		if err != nil {
+			t.Fatalf("CurrentSelf: %v", err)
+		}
+		cm, ok := self.Complex.(complexPublic)
+		if !ok || cm.mode != "app" {
+			t.Errorf("Self.Complex = %#v, want complexPublic{mode:app}", self.Complex)
+		}
+	})
+}
+
+func TestRegisterAsyncPublicHoldsPhase(t *testing.T) {
+	inSpark(t, func(t *testing.T) {
+		var completed atomic.Bool
+		got := RegisterAsync(func(wg *sync.WaitGroup) traitPublicAsync {
+			t := traitPublicAsync{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(50 * time.Millisecond)
+				t.ready = true // mutated locally, not observable via TraitOf
+				completed.Store(true)
+			}()
+			return t
+		})
+		// The returned value is what's registered — the async work
+		// completes later.  RegisterAsync should not block.
+		_ = got
+		start := time.Now()
+		if err := closePhase(); err != nil {
+			t.Fatalf("closePhase: %v", err)
+		}
+		elapsed := time.Since(start)
+		if elapsed < 40*time.Millisecond {
+			t.Errorf("closePhase returned in %v — expected to wait ~50ms for async", elapsed)
+		}
+		if !completed.Load() {
+			t.Error("async goroutine did not complete before closePhase returned")
+		}
+	})
+}
+
+func TestRegisterDuplicatePanics(t *testing.T) {
+	inSpark(t, func(t *testing.T) {
+		Register(func() traitPublic { return traitPublic{tag: "first"} })
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("expected panic on duplicate Register, got clean return")
+			}
+			// panic value should be an error wrapping errDuplicateType.
+			if err, ok := r.(error); !ok || !errors.Is(err, errDuplicateType) {
+				t.Errorf("panic value = %v, want an error wrapping errDuplicateType", r)
+			}
+		}()
+		Register(func() traitPublic { return traitPublic{tag: "second"} })
+	})
+}
+
+// TestMainPhaseClosedAtTestStart verifies that runtime.main's genesis
+// close hook fired before this test runs.  We don't wrap in inSpark:
+// the test's outer goroutine inherits main's identity via `go`, so it
+// shares main's selfState — which should already be frozen.
+func TestMainPhaseClosedAtTestStart(t *testing.T) {
+	_, err := CurrentSelf()
+	if err != nil {
+		t.Fatalf("main goroutine's phase should be closed at test start, got: %v", err)
+	}
+	// RegisterTrait on a frozen phase must error.
+	err = registerTrait(traitPublic{tag: "post-hook"})
+	if !errors.Is(err, errPhaseClosed) {
+		t.Errorf("registerTrait on frozen main: expected errPhaseClosed, got %v", err)
+	}
+}
+
+// TestGenesisBridgeInstalled verifies runtime/genesis actually
+// registered the phase-close hook with the runtime.  The bridge is
+// covered indirectly by TestMainPhaseClosedAtTestStart, but this test
+// asserts the installation happens at package-init time.  It runs
+// even earlier than most tests but the whole test binary has already
+// gone through package init by the time any test runs, so we're
+// verifying "after init, the hook must have fired" — same as the
+// other test, just documenting intent.
+func TestGenesisBridgeInstalled(t *testing.T) {
+	// If the hook installation had been skipped, main's phase would
+	// still be open and any subsequent test using inSpark would work
+	// on the child but CurrentSelf() on the outer test goroutine
+	// would fail.  The success of TestMainPhaseClosedAtTestStart
+	// implies the bridge is in place.  Verify explicitly too:
+	self, err := CurrentSelf()
+	if err != nil {
+		t.Fatalf("CurrentSelf on main-identity test goroutine: %v", err)
+	}
+	// We don't assert anything about the Traits contents — the test
+	// binary doesn't register any.  We just verify the frozen Self
+	// is observable, which is the load-bearing property.
+	_ = self
+}
