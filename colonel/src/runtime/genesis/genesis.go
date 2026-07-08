@@ -38,6 +38,27 @@
 // invoke the close explicitly for the top-level phase; SparkAs
 // handles the close for child phases internally.
 //
+// # Exit
+//
+// Deferral mirrors genesis at both scales.  Two identities are
+// implicitly recognizable to every line of code — the program
+// (runtime) and the current spark (self) — and each has a Defer:
+//
+//   - Defer(func(*sync.WaitGroup)) — run at process shutdown
+//     (main.main returning, or os.Exit).
+//   - DeferSelf(func(*sync.WaitGroup)) — run at the current spark's
+//     exit (its SparkAs work function returning).  From the main
+//     identity this is equivalent to Defer, because main's
+//     self-lifetime is the process lifetime.
+//
+// Cleanups run LIFO and receive the exit WaitGroup — the same async
+// idiom initialization uses: cleanup that can proceed in the
+// background does wg.Add(1) and wg.Done, and the exiting scope does
+// not complete until the group drains.  Deferral is registered
+// beside the creation code it unwinds; there is deliberately no
+// init-time registration form, because cleanup only exists once
+// something real has been created.
+//
 // # Language integration
 //
 // In the intended shape of the JanOS/Glitter stack, Register is what
@@ -83,6 +104,7 @@ package genesis
 import (
 	"errors"
 	"fmt"
+	"internal/runtime/exithook"
 	"os"
 	"reflect"
 	"runtime"
@@ -177,6 +199,12 @@ type selfState struct {
 	// frozen flips true when closePhase completes.  After that,
 	// TraitOf and CurrentSelf answer; registerTrait refuses.
 	frozen bool
+	// deferred holds this identity's spark-exit cleanups, registered
+	// via DeferSelf.  Drained LIFO when the spark's work function
+	// returns (or panics).  Unlike traits, registration is allowed at
+	// any point in the spark's life — cleanup code appears wherever
+	// the resource it releases was created.
+	deferred []func(*sync.WaitGroup)
 }
 
 // registry maps identityBlock address -> selfState.  Populated
@@ -226,6 +254,28 @@ func runtimeJanosSpark(f func())
 func init() {
 	runtimeRegisterBlockFinalizedHook(onBlockFinalized)
 	runtimeSetGenesisClosePhaseHook(mainPhaseCloseHook)
+	// Package inits run on the main goroutine, so the identity we see
+	// here IS main's.  Recorded so DeferSelf can recognize "self ==
+	// the program" and route to the process-shutdown registry.
+	mainBlockAddr = runtimeIdentityBlockAddr(runtime.Identify())
+	// Process-shutdown deferrals ride the runtime's exit-hook
+	// machinery, which fires both when main.main returns and when
+	// os.Exit is called.  RunOnFailure: cleanup still runs on nonzero
+	// exits — a de-energize-the-servo cleanup matters MORE on failure
+	// paths, not less.  (Panics and runtime throws never run exit
+	// hooks; deferral is for orderly exits only.)
+	exithook.Add(exithook.Hook{F: drainShutdown, RunOnFailure: true})
+}
+
+// mainBlockAddr is the identityBlock address of the main goroutine,
+// captured at package-init time (inits run on the main goroutine).
+var mainBlockAddr uintptr
+
+// shutdown is the process-level deferral registry.  Drained LIFO by
+// drainShutdown when the program exits.
+var shutdown struct {
+	mu    sync.Mutex
+	funcs []func(*sync.WaitGroup)
 }
 
 // mainPhaseCloseHook is the function runtime.main invokes to close
@@ -603,6 +653,136 @@ func mustBeInInitPhase() {
 	panic("genesis.Register: must be called during package init — use `var _ = genesis.Register(...)` at package scope")
 }
 
+// Defer registers f to run at process shutdown — when main.main
+// returns or os.Exit is called.  (Panics and runtime throws never
+// reach orderly shutdown; deferral cannot help a crashing process.)
+//
+// Cleanups run LIFO — the most recently registered runs first,
+// mirroring Go's defer statement — and each receives the shutdown
+// WaitGroup.  Synchronous cleanup happens inline; cleanup that can
+// proceed in the background does wg.Add(1), spawns its goroutine,
+// and calls wg.Done when finished:
+//
+//	gpuBuf := allocateGPU()
+//	genesis.Defer(func(wg *sync.WaitGroup) {
+//	    wg.Add(1)
+//	    go func() {
+//	        defer wg.Done()
+//	        gpuBuf.Release()
+//	    }()
+//	})
+//
+// The process does not exit until every registered cleanup has been
+// invoked and the WaitGroup has fully drained.  A cleanup registered
+// DURING shutdown (by another cleanup) is honored — the drain loops
+// until the registry is empty.
+//
+// This is the same WaitGroup idiom the genesis phase uses for async
+// initialization: creation and destruction are symmetric, at both
+// scales.  Deferral is registered next to the creation code it
+// unwinds — there is deliberately no init-time registration form,
+// because cleanup only exists once something real has been created.
+//
+// A cleanup that panics is caught, reported to stderr, and does not
+// prevent the remaining cleanups from running.
+func Defer(f func(*sync.WaitGroup)) {
+	if f == nil {
+		panic("genesis.Defer: nil function")
+	}
+	shutdown.mu.Lock()
+	shutdown.funcs = append(shutdown.funcs, f)
+	shutdown.mu.Unlock()
+}
+
+// DeferSelf registers f to run when the current spark exits — when
+// the work function passed to SparkAs returns (or panics).  Cleanups
+// run LIFO on the spark's own goroutine and receive the spark's exit
+// WaitGroup, with the same synchronous-or-async contract as Defer.
+//
+// DeferSelf may be called from anywhere in the spark's life: inside
+// SparkAs's primaryInit or additionalInits (cleanup registered next
+// to creation), inside the work function, or from any `go` child
+// sharing the spark's identity.  Registration after the spark's work
+// function has returned is not honored — the drain has already run.
+//
+// Called from the main goroutine's identity (or any of its `go`
+// descendants), DeferSelf is equivalent to Defer: main's self-lifetime
+// IS the process lifetime, so its cleanup belongs to process shutdown.
+func DeferSelf(f func(*sync.WaitGroup)) {
+	if f == nil {
+		panic("genesis.DeferSelf: nil function")
+	}
+	addr := runtimeIdentityBlockAddr(runtime.Identify())
+	if addr == 0 {
+		fatalMissingIdentity("DeferSelf")
+	}
+	if addr == mainBlockAddr {
+		Defer(f)
+		return
+	}
+	st := stateForCurrent()
+	if st == nil {
+		fatalMissingIdentity("DeferSelf")
+	}
+	st.mu.Lock()
+	st.deferred = append(st.deferred, f)
+	st.mu.Unlock()
+}
+
+// drainShutdown is the process-shutdown drain, invoked by the
+// runtime's exit-hook machinery.  Loops so that cleanups registered
+// during the drain (teardown cascades) are honored.
+func drainShutdown() {
+	for {
+		shutdown.mu.Lock()
+		fns := shutdown.funcs
+		shutdown.funcs = nil
+		shutdown.mu.Unlock()
+		if len(fns) == 0 {
+			return
+		}
+		runDeferred(fns)
+	}
+}
+
+// drainSelfDeferred drains a spark's exit deferrals.  Runs on the
+// spark's goroutine when its work function returns or panics.  Loops
+// for the same registered-during-drain reason as drainShutdown.
+func drainSelfDeferred(st *selfState) {
+	for {
+		st.mu.Lock()
+		fns := st.deferred
+		st.deferred = nil
+		st.mu.Unlock()
+		if len(fns) == 0 {
+			return
+		}
+		runDeferred(fns)
+	}
+}
+
+// runDeferred invokes a batch of deferral cleanups LIFO, sharing one
+// WaitGroup across the batch, then blocks until the group drains.
+// Each cleanup is individually recovered: a panicking cleanup is
+// reported to stderr and the remaining cleanups still run.  (The
+// runtime's exit-hook runner turns an escaping panic into a hard
+// throw with no context — catching per-cleanup keeps shutdown
+// diagnosable and best-effort.)
+func runDeferred(fns []func(*sync.WaitGroup)) {
+	var wg sync.WaitGroup
+	for i := len(fns) - 1; i >= 0; i-- {
+		func(f func(*sync.WaitGroup)) {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "genesis: deferred cleanup panicked: %v\n", r)
+				}
+			}()
+			f(&wg)
+		}(fns[i])
+	}
+	wg.Wait()
+}
+
 // SparkAs spawns a fresh-identity goroutine, runs a genesis phase on
 // it, and then invokes work with the value produced by primaryInit.
 //
@@ -646,6 +826,11 @@ func SparkAs[TC any](
 		if st == nil {
 			fatalMissingIdentity("SparkAs child")
 		}
+		// Spark-exit deferral: drain when work returns OR panics.
+		// Installed before the inits so a cleanup registered inside
+		// primaryInit/additionalInits still runs if a later init (or
+		// work itself) panics — created resources unwind either way.
+		defer drainSelfDeferred(st)
 		// Inherit parent's traits under the mutex, then release for
 		// child inits to be able to registerTraitAny via the internal
 		// helper.

@@ -465,3 +465,217 @@ func TestMainPhaseClosedAtTestStart(t *testing.T) {
 		t.Errorf("registerTrait on frozen main: expected errPhaseClosed, got %v", err)
 	}
 }
+
+// -- Exit deferral ----------------------------------------------------
+
+// TestRunDeferredLIFOAndAsyncWait drives the shared drain helper
+// directly: three cleanups registered in order 1,2,3 must run 3,2,1,
+// and an async cleanup must complete before runDeferred returns.
+func TestRunDeferredLIFOAndAsyncWait(t *testing.T) {
+	var order []int
+	var mu sync.Mutex
+	var asyncDone atomic.Bool
+
+	fns := []func(*sync.WaitGroup){
+		func(wg *sync.WaitGroup) {
+			mu.Lock()
+			order = append(order, 1)
+			mu.Unlock()
+		},
+		func(wg *sync.WaitGroup) {
+			mu.Lock()
+			order = append(order, 2)
+			mu.Unlock()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				time.Sleep(50 * time.Millisecond)
+				asyncDone.Store(true)
+			}()
+		},
+		func(wg *sync.WaitGroup) {
+			mu.Lock()
+			order = append(order, 3)
+			mu.Unlock()
+		},
+	}
+	start := time.Now()
+	runDeferred(fns)
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Errorf("runDeferred returned in %v — expected to wait ~50ms for async cleanup", elapsed)
+	}
+	if !asyncDone.Load() {
+		t.Error("async cleanup did not complete before runDeferred returned")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) != 3 || order[0] != 3 || order[1] != 2 || order[2] != 1 {
+		t.Errorf("cleanup order = %v, want [3 2 1] (LIFO)", order)
+	}
+}
+
+// TestRunDeferredPanickingCleanupDoesNotBlockOthers verifies the
+// per-cleanup recover: a panicking cleanup is contained and the
+// remaining cleanups still run.
+func TestRunDeferredPanickingCleanupDoesNotBlockOthers(t *testing.T) {
+	var ran []string
+	var mu sync.Mutex
+	fns := []func(*sync.WaitGroup){
+		func(wg *sync.WaitGroup) {
+			mu.Lock()
+			ran = append(ran, "first-registered")
+			mu.Unlock()
+		},
+		func(wg *sync.WaitGroup) {
+			panic("cleanup bug")
+		},
+		func(wg *sync.WaitGroup) {
+			mu.Lock()
+			ran = append(ran, "last-registered")
+			mu.Unlock()
+		},
+	}
+	runDeferred(fns) // must not panic outward
+	mu.Lock()
+	defer mu.Unlock()
+	if len(ran) != 2 || ran[0] != "last-registered" || ran[1] != "first-registered" {
+		t.Errorf("ran = %v, want [last-registered first-registered]", ran)
+	}
+}
+
+// TestDrainShutdownHonorsMidDrainRegistration verifies the loop: a
+// cleanup that Defers another cleanup during the drain gets that
+// second cleanup run too.
+func TestDrainShutdownHonorsMidDrainRegistration(t *testing.T) {
+	var cascaded atomic.Bool
+	Defer(func(wg *sync.WaitGroup) {
+		Defer(func(wg *sync.WaitGroup) {
+			cascaded.Store(true)
+		})
+	})
+	drainShutdown()
+	if !cascaded.Load() {
+		t.Error("cleanup registered during drain did not run")
+	}
+	// Registry must be empty afterward so the real exit-hook drain
+	// at test-binary exit is a no-op.
+	shutdown.mu.Lock()
+	n := len(shutdown.funcs)
+	shutdown.mu.Unlock()
+	if n != 0 {
+		t.Errorf("shutdown registry has %d leftover entries after drain", n)
+	}
+}
+
+// TestDeferSelfDrainsOnSparkExit is the end-to-end: a spark registers
+// exit cleanups from BOTH an init function and the work body; when
+// work returns, both run LIFO on the spark goroutine, async work
+// included, before the spark is considered exited.
+func TestDeferSelfDrainsOnSparkExit(t *testing.T) {
+	// Parent phase must be closed to SparkAs.
+	if err := closePhase(); err != nil && !errors.Is(err, errPhaseClosed) {
+		t.Fatalf("parent closePhase: %v", err)
+	}
+
+	events := make(chan string, 4)
+	done := make(chan struct{})
+	err := SparkAs(
+		func(p traitPrimary) {
+			DeferSelf(func(wg *sync.WaitGroup) {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					time.Sleep(30 * time.Millisecond)
+					events <- "work-cleanup-async"
+					close(done)
+				}()
+			})
+			events <- "work-ran"
+		},
+		func() traitPrimary {
+			// Cleanup registered at creation time, inside the init.
+			DeferSelf(func(wg *sync.WaitGroup) {
+				events <- "init-cleanup"
+			})
+			return traitPrimary{role: "deferral-e2e"}
+		},
+	)
+	if err != nil {
+		t.Fatalf("SparkAs: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("spark exit deferrals did not complete within 5s")
+	}
+	close(events)
+	var got []string
+	for e := range events {
+		got = append(got, e)
+	}
+	// work-ran, then LIFO drain: work's cleanup (async) fires Done
+	// after init's cleanup already ran synchronously.  Order of the
+	// two cleanup EVENTS: init-cleanup is synchronous and runs during
+	// the LIFO pass (after work's cleanup *started* its goroutine);
+	// work-cleanup-async lands ~30ms later.  So observed order:
+	// work-ran, init-cleanup, work-cleanup-async.
+	want := []string{"work-ran", "init-cleanup", "work-cleanup-async"}
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestDeferSelfFromMainIdentityRoutesToProcess: the test goroutine
+// shares main's identity, so DeferSelf must land in the process
+// shutdown registry, not a selfState.
+func TestDeferSelfFromMainIdentityRoutesToProcess(t *testing.T) {
+	shutdown.mu.Lock()
+	before := len(shutdown.funcs)
+	shutdown.mu.Unlock()
+
+	DeferSelf(func(wg *sync.WaitGroup) {}) // harmless no-op at real exit
+
+	shutdown.mu.Lock()
+	after := len(shutdown.funcs)
+	shutdown.mu.Unlock()
+	if after != before+1 {
+		t.Fatalf("shutdown registry grew by %d, want 1 (DeferSelf from main identity must route to Defer)", after-before)
+	}
+
+	// And main's selfState must NOT have accumulated a deferred entry.
+	st := stateForCurrent()
+	if st == nil {
+		t.Fatal("no selfState for main identity")
+	}
+	st.mu.Lock()
+	n := len(st.deferred)
+	st.mu.Unlock()
+	if n != 0 {
+		t.Errorf("main selfState.deferred has %d entries, want 0", n)
+	}
+}
+
+// TestDeferNilPanics / TestDeferSelfNilPanics: nil cleanups are
+// programming errors, caught at registration.
+func TestDeferNilPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic on nil Defer")
+		}
+	}()
+	Defer(nil)
+}
+
+func TestDeferSelfNilPanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic on nil DeferSelf")
+		}
+	}()
+	DeferSelf(nil)
+}
