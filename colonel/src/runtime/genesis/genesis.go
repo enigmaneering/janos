@@ -12,55 +12,48 @@
 // fresh one built from parent-inherited Traits plus their own new
 // contributions.
 //
-// Package inits contribute Traits at program boot: each package that
-// calls RegisterTrait during its init() imprints one Trait on the main
-// goroutine's Self.  Once every init has run, the main goroutine calls
-// ClosePhase and Self "opens" — TraitOf begins returning values, and
-// no further Traits can be registered on this identity.
+// # Public API
 //
-// SparkAs spawns a fresh-identity goroutine whose Self is built the
-// same way: parent's Traits are inherited verbatim, then the caller's
-// variadic init functions contribute the child's own Complex and any
-// new Traits, then the child's phase closes and its work function
-// runs with a fully-formed Self.
+// User code interacts with genesis through three functions:
+//
+//   - TraitOf[T](filters ...string) — query a trait by type, optionally
+//     narrowed by module and/or package.
+//   - CurrentSelf() — read the assembled Self.
+//   - SparkAs[TC] — spawn a fresh-identity goroutine with its own
+//     genesis phase.
+//
+// Registering traits, setting the primary Complex, managing the
+// phase's WaitGroup, and closing the phase are runtime-internal
+// mechanics.  In the finished design, `func init() T` in user code
+// is what expresses the intent; the compiler emits the internal
+// calls.  Nothing in the public API of this package invokes the
+// registration path directly.
 //
 // # Atomic-on-open
 //
-// Traits registered during a genesis phase are not observable via
-// TraitOf until ClosePhase is called.  This makes the phase a
-// well-defined transition: user code either sees no Self (before
-// close) or a complete Self (after).  There is no partially-formed
-// state visible to observers.
-//
-// # Async initialization
-//
-// PhaseWaitGroup returns the *sync.WaitGroup for the current phase.
-// A trait initializer that needs to do background work calls
-// wg.Add(1), spawns a goroutine, and that goroutine calls
-// RegisterTrait followed by wg.Done before the goroutine exits.
-// ClosePhase waits on the WaitGroup before freezing the phase — so
-// async traits appear together with synchronous ones when the phase
-// opens.
+// The phase transitions atomically from "gathering" to "open".
+// Traits contributed during gathering are not observable via TraitOf
+// until the phase closes; once it does, they all become observable
+// together.  User code sees either no Self or a complete Self —
+// never a partially-formed one.
 //
 // # Uniqueness
 //
 // Within a single identity's Self, each Trait's Complex type is
-// unique.  RegisterTrait rejects a second contribution of the same
-// type on the same identity.  Independent Spark subtrees can each
-// hold their own trait of the same type; the constraint is per-
-// identity, not global.
+// unique.  Independent Spark subtrees can each hold their own trait
+// of the same type; the constraint is per-identity, not global.
+// A future compiler pass will lift most cases into compile-time
+// errors.
 //
-// This restriction is currently enforced at runtime.  A future
-// compiler pass will hoist most cases into compile-time errors.
-//
-// # Phase 1
+// # Phase 1 status
 //
 // This package is the runtime-only surface of the genesis system.
-// User code registers traits explicitly.  A subsequent compiler phase
-// will make `func init() T` (and its *sync.WaitGroup variant)
-// implicitly emit these calls, along with cross-package uniqueness
-// checks at link time.  The runtime semantics won't change; the
-// language surface will get thinner.
+// Without compiler support, no user program produces a Self today —
+// the internal registration path is exercised only by the compiler
+// (once landed) and by this package's own tests.  Phase 2 wires the
+// compiler frontend to detect `func init() T` and emit the internal
+// calls implicitly.  The public API here does not change when that
+// happens; it becomes newly usable.
 package genesis
 
 import (
@@ -73,13 +66,13 @@ import (
 )
 
 // Trait is one package's contribution to a Self.  Module and Package
-// record the fully qualified origin of the contribution — used by
-// TraitOf's variadic filters when a type is (unusually) registered by
-// more than one origin under different filter granularities.
+// record the fully qualified origin of the contribution — surfaced
+// so TraitOf's variadic filters can disambiguate when a type is
+// contributed under different origins.
 //
-// Complex is the value returned by that package's typed init function.
-// It is stored as any and recovered by TraitOf via its generic type
-// parameter.
+// Complex is the value produced by that package's typed init
+// function.  It is stored as any and recovered by TraitOf via its
+// generic type parameter.
 type Trait struct {
 	Module  string
 	Package string
@@ -94,29 +87,16 @@ type Self struct {
 	Traits  []Trait
 }
 
-// Sentinel errors surfaced by the package.
+// Sentinel errors returned by the public API.
 var (
-	// ErrNoIdentity: the current goroutine has no JanOS identity block
-	// (should not normally occur — main and every descendant have one).
+	// ErrNoIdentity: the current goroutine has no JanOS identity block.
+	// Should not normally occur — main and every descendant have one.
 	ErrNoIdentity = errors.New("genesis: no identity on current goroutine")
 
-	// ErrPhaseOpen: TraitOf or CurrentSelf called before ClosePhase.
+	// ErrPhaseOpen: TraitOf, CurrentSelf, or SparkAs (on the parent)
+	// was called before the current identity's genesis phase closed.
 	// Self is not observable during the gathering phase.
 	ErrPhaseOpen = errors.New("genesis: phase still open; Self is not yet observable")
-
-	// ErrPhaseClosed: RegisterTrait or SetComplex called after
-	// ClosePhase.  The Self is frozen and no further contributions
-	// are permitted.
-	ErrPhaseClosed = errors.New("genesis: phase already closed; Self is frozen")
-
-	// ErrDuplicateType: RegisterTrait attempted to add a Trait whose
-	// Complex type already exists in this Self (whether contributed
-	// locally or inherited from a parent Spark).
-	ErrDuplicateType = errors.New("genesis: trait type already registered on this identity")
-
-	// ErrComplexAlreadySet: SetComplex called more than once on the
-	// same phase.
-	ErrComplexAlreadySet = errors.New("genesis: Complex already set on this identity")
 
 	// ErrNotFound: TraitOf found no Trait matching the requested type
 	// (and any filters).
@@ -125,10 +105,15 @@ var (
 	// ErrAmbiguous: TraitOf found more than one Trait matching the
 	// requested type (and any filters).  Add filters to narrow.
 	ErrAmbiguous = errors.New("genesis: multiple matching traits; add filters")
+)
 
-	// ErrPhaseNotOpen: internal — the current identity has no active
-	// phase.  Should not surface to well-formed callers.
-	ErrPhaseNotOpen = errors.New("genesis: no active phase on this identity")
+// Internal-only sentinel errors.  Surface through panics from
+// compiler-emitted code (or SparkAs's child) when the invariants
+// they guard are violated.
+var (
+	errPhaseClosed       = errors.New("genesis: phase already closed; Self is frozen")
+	errDuplicateType     = errors.New("genesis: trait type already registered on this identity")
+	errComplexAlreadySet = errors.New("genesis: Complex already set on this identity")
 )
 
 // selfState is the internal per-identity backing of a Self.  One
@@ -143,13 +128,13 @@ type selfState struct {
 	// uniqueness check and TraitOf lookup.
 	typeIdx map[reflect.Type]int
 	// wg is the phase's WaitGroup.  Async trait initializers Add/Done
-	// on it; ClosePhase waits on it before freezing.
+	// on it; closePhase waits on it before freezing.
 	wg sync.WaitGroup
-	// frozen flips true when ClosePhase completes.  After that,
-	// TraitOf and CurrentSelf answer; RegisterTrait and SetComplex
+	// frozen flips true when closePhase completes.  After that,
+	// TraitOf and CurrentSelf answer; registerTrait and setComplex
 	// refuse.
 	frozen bool
-	// complexSet distinguishes "SetComplex explicitly called" from
+	// complexSet distinguishes "setComplex explicitly called" from
 	// "complex is still the zero value".
 	complexSet bool
 }
@@ -217,8 +202,8 @@ func stateForCurrent() *selfState {
 // qualified function name.  Best-effort: on stripped or inlined
 // builds, either field may be empty.
 func callerOrigin() (module, pkg string) {
-	// Skip: 0 runtime.Callers, 1 callerOrigin, 2 exported wrapper
-	// (RegisterTrait/SetComplex), 3 user code.
+	// Skip: 0 runtime.Callers, 1 callerOrigin, 2 internal wrapper
+	// (registerTrait/setComplex), 3 user code.
 	var pcs [8]uintptr
 	n := runtime.Callers(3, pcs[:])
 	if n == 0 {
@@ -233,10 +218,6 @@ func callerOrigin() (module, pkg string) {
 			}
 			continue
 		}
-		// f.Function is like "github.com/enigmaneering/janos/example/pkg.init.0"
-		// Split at the last "/" to isolate the package tail from
-		// the module prefix; then split at the final "." to get
-		// the package name.
 		module, pkg = parseFuncOrigin(f.Function)
 		if pkg != "" {
 			return module, pkg
@@ -282,20 +263,15 @@ func parseFuncOrigin(fn string) (module, pkg string) {
 	return fn[:slash], fn[slash+1 : dot]
 }
 
-// RegisterTrait contributes t as a Trait on the current goroutine's
-// Self.  The Trait's Module and Package are derived from the caller's
-// fully qualified function name.
+// registerTrait contributes t as a Trait on the current goroutine's
+// Self.  Called by compiler-emitted code for each package that has a
+// typed `func init() T`; not part of the public API.
 //
-// Errors:
+// The Trait's Module and Package are derived from the caller's fully
+// qualified function name.
 //
-//   - ErrNoIdentity if the current goroutine has no identity block.
-//   - ErrPhaseClosed if ClosePhase has already been called.
-//   - ErrDuplicateType if a Trait of type T is already registered on
-//     this identity (either locally or inherited from a parent Spark).
-//
-// The registered Trait is not observable via TraitOf until ClosePhase
-// completes.
-func RegisterTrait[T any](t T) error {
+// Errors: ErrNoIdentity, errPhaseClosed, errDuplicateType.
+func registerTrait[T any](t T) error {
 	st := stateForCurrent()
 	if st == nil {
 		return ErrNoIdentity
@@ -305,11 +281,11 @@ func RegisterTrait[T any](t T) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.frozen {
-		return ErrPhaseClosed
+		return errPhaseClosed
 	}
 	if existing, dup := st.typeIdx[typ]; dup {
 		return fmt.Errorf("%w: %v already contributed by %s/%s",
-			ErrDuplicateType, typ,
+			errDuplicateType, typ,
 			st.traits[existing].Module, st.traits[existing].Package)
 	}
 	st.traits = append(st.traits, Trait{
@@ -321,18 +297,13 @@ func RegisterTrait[T any](t T) error {
 	return nil
 }
 
-// SetComplex records t as the primary Complex of the current
-// goroutine's Self.  For a main goroutine this is called from the
-// main package's typed init; for a SparkAs child it is called
-// internally by SparkAs and users need not invoke it themselves.
+// setComplex records t as the primary Complex of the current
+// goroutine's Self.  For a main goroutine this is emitted by the
+// compiler from the main package's typed init; for a SparkAs child
+// SparkAs invokes it directly.  Not part of the public API.
 //
-// Errors:
-//
-//   - ErrNoIdentity if the current goroutine has no identity block.
-//   - ErrPhaseClosed if ClosePhase has already been called.
-//   - ErrComplexAlreadySet if SetComplex was already invoked on this
-//     phase.
-func SetComplex[T any](t T) error {
+// Errors: ErrNoIdentity, errPhaseClosed, errComplexAlreadySet.
+func setComplex[T any](t T) error {
 	st := stateForCurrent()
 	if st == nil {
 		return ErrNoIdentity
@@ -340,26 +311,24 @@ func SetComplex[T any](t T) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.frozen {
-		return ErrPhaseClosed
+		return errPhaseClosed
 	}
 	if st.complexSet {
-		return ErrComplexAlreadySet
+		return errComplexAlreadySet
 	}
 	st.complex = t
 	st.complexSet = true
 	return nil
 }
 
-// PhaseWaitGroup returns the *sync.WaitGroup for the current
-// identity's genesis phase.  Callers that need to do background work
-// before the phase closes should Add(1) before spawning the goroutine
-// and Done() from within it (after any RegisterTrait call).
-// ClosePhase blocks on this WaitGroup before freezing the phase, so
-// async trait registrations complete before Self opens.
+// phaseWaitGroup returns the *sync.WaitGroup for the current
+// identity's genesis phase.  Compiler-emitted async initializers
+// (from `func init(wg *sync.WaitGroup) T`) receive this WG.  Not
+// part of the public API.
 //
 // Returns nil if the current goroutine has no identity block or the
 // phase has already closed.
-func PhaseWaitGroup() *sync.WaitGroup {
+func phaseWaitGroup() *sync.WaitGroup {
 	st := stateForCurrent()
 	if st == nil {
 		return nil
@@ -372,27 +341,25 @@ func PhaseWaitGroup() *sync.WaitGroup {
 	return &st.wg
 }
 
-// ClosePhase freezes the current goroutine's genesis phase.  Blocks
-// until any background work Add-ed to PhaseWaitGroup has completed.
-// After ClosePhase returns:
+// closePhase freezes the current goroutine's genesis phase.  Blocks
+// until any background work Add-ed to phaseWaitGroup has completed.
+// Emitted by the compiler at the end of the program-init sequence and
+// invoked internally by SparkAs before its work function runs.  Not
+// part of the public API.
 //
-//   - RegisterTrait and SetComplex refuse further contributions.
-//   - TraitOf and CurrentSelf begin returning the assembled Self.
-//
-// Calling ClosePhase twice on the same identity returns
-// ErrPhaseClosed.
-func ClosePhase() error {
+// Errors: ErrNoIdentity, errPhaseClosed.
+func closePhase() error {
 	st := stateForCurrent()
 	if st == nil {
 		return ErrNoIdentity
 	}
 	// Take the mutex briefly to check state, then release for Wait to
 	// avoid holding the mutex while background goroutines might want
-	// to RegisterTrait.
+	// to registerTrait.
 	st.mu.Lock()
 	if st.frozen {
 		st.mu.Unlock()
-		return ErrPhaseClosed
+		return errPhaseClosed
 	}
 	st.mu.Unlock()
 	// Wait outside the mutex so async initializers can register.
@@ -400,16 +367,14 @@ func ClosePhase() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.frozen {
-		// Someone else raced us to close.  Idempotent-ish, but flag
-		// the double-close as an error so callers notice.
-		return ErrPhaseClosed
+		return errPhaseClosed
 	}
 	st.frozen = true
 	return nil
 }
 
 // CurrentSelf returns the current goroutine's Self.  Errors with
-// ErrPhaseOpen if ClosePhase has not been called yet; errors with
+// ErrPhaseOpen if the phase has not closed yet; errors with
 // ErrNoIdentity if the current goroutine has no identity block.
 //
 // The returned Self's Traits slice is a fresh copy — callers may
@@ -434,12 +399,7 @@ func CurrentSelf() (Self, error) {
 // traits; one filter matches Module; two filters match (Module,
 // Package).
 //
-// Errors:
-//
-//   - ErrNoIdentity if the current goroutine has no identity block.
-//   - ErrPhaseOpen if ClosePhase has not been called yet.
-//   - ErrNotFound if no trait matches the type-and-filters.
-//   - ErrAmbiguous if more than one trait matches.
+// Errors: ErrNoIdentity, ErrPhaseOpen, ErrNotFound, ErrAmbiguous.
 func TraitOf[T any](filters ...string) (T, error) {
 	var zero T
 	st := stateForCurrent()
@@ -460,7 +420,7 @@ func TraitOf[T any](filters ...string) (T, error) {
 		return zero, ErrNotFound
 	}
 	// With filters we scan (traits are typically small).
-	var matchedIdx = -1
+	matchedIdx := -1
 	for i, tr := range st.traits {
 		if reflect.TypeOf(tr.Complex) != typ {
 			continue
@@ -488,7 +448,7 @@ func TraitOf[T any](filters ...string) (T, error) {
 // Genesis on the child:
 //
 //  1. The parent's Traits are inherited verbatim (parent must have
-//     ClosePhase'd; otherwise ErrPhaseOpen is returned to the parent).
+//     closed its phase; otherwise ErrPhaseOpen is returned).
 //  2. complexInit runs on the child and its result becomes Self.Complex.
 //  3. Each function in traitInits runs on the child; its result is
 //     registered as a Trait (type-erased through the variadic; the
@@ -520,7 +480,8 @@ func SparkAs[TC any](
 			panic("genesis: SparkAs child has no identity block")
 		}
 		// Inherit parent's traits under the mutex, then release for
-		// user init to be able to RegisterTrait via the exported API.
+		// user init to be able to registerTrait via the internal
+		// helper.
 		st.mu.Lock()
 		for _, tr := range parentSelf.Traits {
 			typ := reflect.TypeOf(tr.Complex)
@@ -532,8 +493,8 @@ func SparkAs[TC any](
 		// Complex is the child's own — call complexInit on the child
 		// so it can observe the child's identity if it wants.
 		c := complexInit()
-		if err := SetComplex(c); err != nil {
-			panic(fmt.Errorf("genesis: SparkAs SetComplex failed: %w", err))
+		if err := setComplex(c); err != nil {
+			panic(fmt.Errorf("genesis: SparkAs setComplex failed: %w", err))
 		}
 		// Trait initializers.  Type-erased through the variadic.
 		for i, init := range traitInits {
@@ -545,8 +506,8 @@ func SparkAs[TC any](
 				panic(fmt.Errorf("genesis: SparkAs traitInit[%d] failed: %w", i, err))
 			}
 		}
-		if err := ClosePhase(); err != nil {
-			panic(fmt.Errorf("genesis: SparkAs ClosePhase failed: %w", err))
+		if err := closePhase(); err != nil {
+			panic(fmt.Errorf("genesis: SparkAs closePhase failed: %w", err))
 		}
 		work(c)
 	})
@@ -565,17 +526,15 @@ func registerTraitAny(v any) error {
 	if st == nil {
 		return ErrNoIdentity
 	}
-	// Origin here would be SparkAs itself; walk one more frame back
-	// to find the caller of SparkAs.
 	module, pkg := callerOrigin()
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if st.frozen {
-		return ErrPhaseClosed
+		return errPhaseClosed
 	}
 	if existing, dup := st.typeIdx[typ]; dup {
 		return fmt.Errorf("%w: %v already contributed by %s/%s",
-			ErrDuplicateType, typ,
+			errDuplicateType, typ,
 			st.traits[existing].Module, st.traits[existing].Package)
 	}
 	st.traits = append(st.traits, Trait{
