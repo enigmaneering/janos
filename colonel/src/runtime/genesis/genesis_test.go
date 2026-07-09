@@ -683,7 +683,7 @@ func TestDeferSelfNilPanics(t *testing.T) {
 // -- Inception --------------------------------------------------------
 
 // TestInceptionMainIsBootStamp: the main identity's inception comes
-// from the runtime's schedinit walltime stamp — nonzero, in the past,
+// from the genesis-package-init wall-clock stamp — nonzero, in the past,
 // and recent (this test binary just booted).  Two reads agree.
 func TestInceptionMainIsBootStamp(t *testing.T) {
 	self, err := CurrentSelf()

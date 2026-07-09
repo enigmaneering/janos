@@ -364,37 +364,19 @@ func janosHKDFExpand32(prk, info []byte) [32]byte {
 	return janosHMACSHA256(prk, buf)
 }
 
-// janosBootSec/janosBootNsec record the wall-clock time at which the
-// main goroutine's identity was minted — the program's inception.
-// Stamped at the top of janosInitIdentity (schedinit), before any
-// package init or user code runs.  Read by runtime/genesis via the
-// janosBootWalltime linkname bridge to back Self.Inception for the
-// main identity.
-var (
-	janosBootSec  int64
-	janosBootNsec int32
-)
-
-// janosBootWalltime returns the boot inception stamp.  Reached from
-// runtime/genesis via //go:linkname; deliberately unexported.
-//
-// Do not change signature: used via linkname from runtime/genesis.
-//
-//go:linkname janosBootWalltime
-func janosBootWalltime() (int64, int32) {
-	return janosBootSec, janosBootNsec
-}
-
 // janosInitIdentity is called from schedinit after janosInitInstanceID
 // runs so the InstanceID is available for future parent-InstanceID
 // recording.
 //
+// Main's inception timestamp is NOT captured here: schedinit runs
+// before package time is initialized and before a portable wall-clock
+// reading is available (several platforms implement time.now directly
+// in assembly with no Go-callable walltime).  runtime/genesis captures
+// it instead, at the earliest point a wall-clock time.Time can be
+// formed — its own package init, still before user main.
+//
 //go:nosplit
 func janosInitIdentity() {
-	// Inception first: the earliest moment in program initialization
-	// that can logically become a time.Time.  The identity about to
-	// be minted is born at this instant.
-	janosBootSec, janosBootNsec = walltime()
 	for i := 0; i < 4; i++ {
 		r := rand()
 		for j := 0; j < 8; j++ {

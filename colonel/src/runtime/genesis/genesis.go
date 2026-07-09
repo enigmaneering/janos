@@ -143,12 +143,13 @@ type Self struct {
 
 // Inception returns the moment this spark was created.
 //
-// For the main identity this is stamped at schedinit — when the
-// runtime mints the program's identity, before any package init or
-// user code runs.  For a SparkAs child it is captured as the very
-// first action of the SparkAs call, on the parent's goroutine,
-// before the child is spawned.  Goroutines sharing an identity via
-// `go` inheritance share their spark's inception.
+// For the main identity this is stamped when the genesis package
+// initializes — the earliest point in program startup at which a
+// wall-clock time.Time can be formed, still before any user code
+// runs.  For a SparkAs child it is captured as the very first action
+// of the SparkAs call, on the parent's goroutine, before the child is
+// spawned.  Goroutines sharing an identity via `go` inheritance share
+// their spark's inception.
 func (s Self) Inception() time.Time {
 	return s.inception
 }
@@ -276,14 +277,6 @@ func runtimeSetGenesisClosePhaseHook(fn func())
 //go:linkname runtimeJanosSpark runtime.janosSpark
 func runtimeJanosSpark(f func())
 
-// runtimeBootWalltime is runtime.janosBootWalltime reached via
-// linkname: the wall-clock stamp taken at schedinit when the main
-// goroutine's identity was minted.  Backs Self.Inception for the
-// main identity.
-//
-//go:linkname runtimeBootWalltime runtime.janosBootWalltime
-func runtimeBootWalltime() (int64, int32)
-
 func init() {
 	runtimeRegisterBlockFinalizedHook(onBlockFinalized)
 	runtimeSetGenesisClosePhaseHook(mainPhaseCloseHook)
@@ -291,6 +284,12 @@ func init() {
 	// here IS main's.  Recorded so DeferSelf can recognize "self ==
 	// the program" and route to the process-shutdown registry.
 	mainBlockAddr = runtimeIdentityBlockAddr(runtime.Identify())
+	// Main's inception: the earliest point a wall-clock time.Time can
+	// be formed.  schedinit (where main's identity is minted) runs
+	// before package time is up and has no portable wall clock, so
+	// genesis package init — still before user main — is the true
+	// "earliest capturable birth moment" for the program.
+	mainInception = time.Now()
 	// Process-shutdown deferrals ride the runtime's exit-hook
 	// machinery, which fires both when main.main returns and when
 	// os.Exit is called.  RunOnFailure: cleanup still runs on nonzero
@@ -303,6 +302,11 @@ func init() {
 // mainBlockAddr is the identityBlock address of the main goroutine,
 // captured at package-init time (inits run on the main goroutine).
 var mainBlockAddr uintptr
+
+// mainInception is the wall-clock birth stamp of the main identity,
+// captured in genesis package init.  Copied into main's selfState
+// when it is first created.
+var mainInception time.Time
 
 // shutdown is the process-level deferral registry.  Drained LIFO by
 // drainShutdown when the program exits.
@@ -348,11 +352,7 @@ func stateForCurrent() *selfState {
 	}
 	st := &selfState{typeIdx: map[reflect.Type]int{}}
 	if addr == mainBlockAddr {
-		// Main's inception is the runtime's schedinit stamp — the
-		// moment the program's identity was minted, before any
-		// package init ran.
-		sec, nsec := runtimeBootWalltime()
-		st.inception = time.Unix(sec, int64(nsec))
+		st.inception = mainInception
 	}
 	registry[addr] = st
 	return st
