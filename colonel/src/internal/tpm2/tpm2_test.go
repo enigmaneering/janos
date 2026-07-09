@@ -6,6 +6,10 @@ package tpm2
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/sha256"
+	"math/big"
 	"testing"
 )
 
@@ -226,5 +230,85 @@ func TestDeviceLive(t *testing.T) {
 	}
 	if info.Manufacturer == "" {
 		t.Errorf("manufacturer is empty — GetCapability parse likely broken")
+	}
+}
+
+// TestKeyLive exercises the TPM key hierarchy against a real device,
+// mirroring the internal/secureenclave provider tests.  Skips without
+// a TPM.
+func TestKeyLive(t *testing.T) {
+	dev, err := Open()
+	if err == ErrNoDevice {
+		t.Skip("no TPM device on this host")
+	}
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer dev.Close()
+
+	k, err := dev.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	defer k.Close()
+
+	// Public point must be a valid P-256 point.
+	pt, err := k.PublicPoint()
+	if err != nil {
+		t.Fatalf("PublicPoint: %v", err)
+	}
+	x := new(big.Int).SetBytes(pt[:32])
+	y := new(big.Int).SetBytes(pt[32:])
+	if !elliptic.P256().IsOnCurve(x, y) {
+		t.Fatalf("public point not on P-256: %x", pt)
+	}
+	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+
+	// A signature from the in-TPM key verifies against its public
+	// point — the load-bearing proof it's a real, self-consistent
+	// keypair whose private half is in the TPM.
+	digest := sha256.Sum256([]byte("janos tpm attestation"))
+	sig, err := k.Sign(digest[:])
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if len(sig) != 64 {
+		t.Fatalf("signature = %d bytes, want 64 (r||s)", len(sig))
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	if !ecdsa.Verify(pub, digest[:], r, s) {
+		t.Fatalf("TPM signature did not verify against its own public point")
+	}
+	other := sha256.Sum256([]byte("different message"))
+	if ecdsa.Verify(pub, other[:], r, s) {
+		t.Fatalf("signature verified for the wrong digest")
+	}
+	t.Logf("TPM key public X = %x", pt[:32])
+
+	// ECDH between two TPM keys must agree.
+	k2, err := dev.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey 2: %v", err)
+	}
+	defer k2.Close()
+	p1, _ := k.PublicPoint()
+	p2, _ := k2.PublicPoint()
+	if p1 == p2 {
+		t.Fatalf("two TPM keys share a public point")
+	}
+	ab, err := k.ECDH(p2)
+	if err != nil {
+		t.Fatalf("k.ECDH(k2): %v", err)
+	}
+	ba, err := k2.ECDH(p1)
+	if err != nil {
+		t.Fatalf("k2.ECDH(k): %v", err)
+	}
+	if !bytes.Equal(ab, ba) {
+		t.Fatalf("ECDH mismatch:\n  a·B = %x\n  b·A = %x", ab, ba)
+	}
+	if len(ab) != 32 {
+		t.Errorf("ECDH shared secret = %d bytes, want 32", len(ab))
 	}
 }
