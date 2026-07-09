@@ -198,7 +198,9 @@ func (k *Key) PublicPoint() ([64]byte, error) {
 
 // Sign produces an ECDSA signature over a 32-byte SHA-256 digest,
 // computed by the Secure Enclave using the in-enclave private key.
-// The signature is X9.62 DER-encoded.
+// The signature is returned as raw r||s (64 bytes) — the same format
+// as internal/tpm2 and the JanOS runtime P-256 verifier — even though
+// the Security framework hands back X9.62 DER internally.
 func (k *Key) Sign(digest []byte) ([]byte, error) {
 	if k.ref == nil {
 		return nil, ErrUnavailable
@@ -216,7 +218,7 @@ func (k *Key) Sign(digest []byte) ([]byte, error) {
 	if rc != 0 {
 		return nil, takeErr("sign", cErr)
 	}
-	return out[:int(outLen)], nil
+	return derToRS(out[:int(outLen)])
 }
 
 // ECDH computes the ECDH shared secret between this key and a peer's
@@ -253,4 +255,50 @@ func (k *Key) Close() error {
 		k.ref = nil
 	}
 	return nil
+}
+
+// derToRS converts an X9.62 DER ECDSA signature — SEQUENCE { INTEGER
+// r, INTEGER s } — into fixed 64-byte r||s for P-256.  DER INTEGERs
+// are minimal (a leading 0x00 appears only to keep them positive, and
+// short values are not left-padded), so each is stripped and
+// right-aligned into its 32-byte field.
+func derToRS(der []byte) ([]byte, error) {
+	if len(der) < 8 || der[0] != 0x30 {
+		return nil, errors.New("secureenclave: malformed ECDSA DER")
+	}
+	i := 2
+	if der[1]&0x80 != 0 { // long-form SEQUENCE length
+		i = 2 + int(der[1]&0x7f)
+	}
+	readInt := func() ([]byte, error) {
+		if i+2 > len(der) || der[i] != 0x02 {
+			return nil, errors.New("secureenclave: expected DER INTEGER")
+		}
+		l := int(der[i+1])
+		i += 2
+		if l < 0 || i+l > len(der) {
+			return nil, errors.New("secureenclave: truncated DER INTEGER")
+		}
+		v := der[i : i+l]
+		i += l
+		for len(v) > 0 && v[0] == 0x00 {
+			v = v[1:]
+		}
+		if len(v) > 32 {
+			return nil, errors.New("secureenclave: ECDSA integer exceeds 32 bytes")
+		}
+		return v, nil
+	}
+	r, err := readInt()
+	if err != nil {
+		return nil, err
+	}
+	s, err := readInt()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 64)
+	copy(out[32-len(r):32], r)
+	copy(out[64-len(s):64], s)
+	return out, nil
 }

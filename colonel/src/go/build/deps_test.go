@@ -436,6 +436,11 @@ var depsRules = `
 	CGO, FMT
 	< internal/secureenclave;
 
+	# internal/hwkey unifies the per-OS hardware-key providers behind
+	# one interface: TPM (Linux/Windows) or Secure Enclave (macOS).
+	internal/secureenclave, internal/tpm2
+	< internal/hwkey;
+
 	sync
 	< internal/singleflight;
 

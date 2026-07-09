@@ -50,13 +50,18 @@ func TestSignVerifiesAgainstPublicPoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
-	if !ecdsa.VerifyASN1(pub, digest[:], sig) {
+	if len(sig) != 64 {
+		t.Fatalf("signature = %d bytes, want 64 (r||s)", len(sig))
+	}
+	r := new(big.Int).SetBytes(sig[:32])
+	s := new(big.Int).SetBytes(sig[32:])
+	if !ecdsa.Verify(pub, digest[:], r, s) {
 		t.Fatalf("enclave signature did not verify against its own public point")
 	}
 
 	// A different digest must NOT verify under the same signature.
 	other := sha256.Sum256([]byte("different message"))
-	if ecdsa.VerifyASN1(pub, other[:], sig) {
+	if ecdsa.Verify(pub, other[:], r, s) {
 		t.Fatalf("signature verified for the wrong digest")
 	}
 }
