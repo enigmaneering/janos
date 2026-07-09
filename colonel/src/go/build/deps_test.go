@@ -243,7 +243,8 @@ var depsRules = `
 
 	# Misc packages needing only FMT.
 	FMT
-	< html,
+	< attest,
+	  html,
 	  internal/dag,
 	  internal/goroot,
 	  internal/types/errors,
