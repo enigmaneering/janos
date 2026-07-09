@@ -7,6 +7,7 @@
 package attest
 
 import (
+	"internal/tpm2"
 	"syscall"
 	"unsafe"
 )
@@ -61,11 +62,35 @@ func probe() (Capability, error) {
 	if version != 2 {
 		return Capability{}, ErrUnavailable
 	}
-	return Capability{
+	c := Capability{
 		Mechanism: MechanismTPM20,
 		Route:     "TBS",
 		Version:   "TPM 2.0",
-	}, nil
+	}
+	enrichFromTPM(&c)
+	return c, nil
+}
+
+// enrichFromTPM opens the TPM through TBS and replaces the generic
+// "TPM 2.0" identity with the device's own manufacturer and family
+// from TPM2_GetCapability.  Any failure leaves the fields untouched;
+// detection does not depend on it.
+func enrichFromTPM(c *Capability) {
+	dev, err := tpm2.Open()
+	if err != nil {
+		return
+	}
+	defer dev.Close()
+	info, err := dev.Info()
+	if err != nil {
+		return
+	}
+	if info.Manufacturer != "" {
+		c.Vendor = info.Manufacturer
+	}
+	if info.Family != "" {
+		c.Version = "TPM " + info.Family
+	}
 }
 
 func available() bool {

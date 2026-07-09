@@ -8,6 +8,7 @@ package attest
 
 import (
 	"fmt"
+	"internal/tpm2"
 	"os"
 	"strings"
 )
@@ -37,14 +38,39 @@ func probe() (Capability, error) {
 				fmt.Errorf("attest: TPM present at %s but not accessible: %w", route, err)
 		}
 		f.Close()
-		return Capability{
+		c := Capability{
 			Mechanism: MechanismTPM20,
 			Route:     route,
 			Version:   linuxTPMVersion(),
 			Vendor:    linuxTPMVendor(),
-		}, nil
+		}
+		enrichFromTPM(&c)
+		return c, nil
 	}
 	return Capability{}, ErrUnavailable
+}
+
+// enrichFromTPM opens the TPM directly and replaces the best-effort
+// sysfs Vendor/Version with the device's own reported identity —
+// manufacturer and firmware straight from TPM2_GetCapability.  Any
+// failure leaves the sysfs-derived fields in place; detection never
+// depends on the richer query succeeding.
+func enrichFromTPM(c *Capability) {
+	dev, err := tpm2.Open()
+	if err != nil {
+		return
+	}
+	defer dev.Close()
+	info, err := dev.Info()
+	if err != nil {
+		return
+	}
+	if info.Manufacturer != "" {
+		c.Vendor = info.Manufacturer
+	}
+	if info.Family != "" {
+		c.Version = "TPM " + info.Family
+	}
 }
 
 func available() bool {

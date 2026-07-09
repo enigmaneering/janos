@@ -243,17 +243,20 @@ var depsRules = `
 
 	# Misc packages needing only FMT.
 	FMT
-	< attest,
-	  html,
+	< html,
 	  internal/dag,
 	  internal/goroot,
 	  internal/types/errors,
+	  internal/tpm2,
 	  mime/quotedprintable,
 	  net/internal/socktest,
 	  runtime/genesis,
 	  runtime/trace,
 	  text/scanner,
 	  text/tabwriter;
+
+	FMT, internal/tpm2
+	< attest;
 
 	io, reflect
 	< internal/saferio;
