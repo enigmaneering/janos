@@ -13,9 +13,6 @@ import (
 
 func TestIdentifyMainReturnsValid(t *testing.T) {
 	id := runtime.Identify()
-	if id.Index == 0 {
-		t.Fatal("main goroutine's Identity.Index is zero")
-	}
 	var zero [64]byte
 	if id.PublicPoint == zero {
 		t.Fatal("main goroutine's Identity.PublicPoint is zero")
@@ -28,8 +25,8 @@ func TestIdentifyGoInheritance(t *testing.T) {
 	go func() { ch <- runtime.Identify() }()
 	child := <-ch
 	if child != me {
-		t.Fatalf("go-child Identity != main:\n  child: Index=%d\n  main:  Index=%d",
-			child.Index, me.Index)
+		t.Fatalf("go-child Identity != main:\n  child: %x\n  main:  %x",
+			child.PublicPoint, me.PublicPoint)
 	}
 }
 
@@ -37,8 +34,8 @@ func TestIdentifyStableAcrossCalls(t *testing.T) {
 	a := runtime.Identify()
 	b := runtime.Identify()
 	if a != b {
-		t.Fatalf("two Identify() calls on same goroutine differ:\n  a: %d\n  b: %d",
-			a.Index, b.Index)
+		t.Fatalf("two Identify() calls on same goroutine differ:\n  a: %x\n  b: %x",
+			a.PublicPoint, b.PublicPoint)
 	}
 }
 
@@ -54,9 +51,6 @@ func TestSparkMintsDistinctIdentity(t *testing.T) {
 	if sparked == me {
 		t.Fatal("Sparked Identity equals main's — mint did not fire")
 	}
-	if sparked.Index == me.Index {
-		t.Fatalf("Sparked Index collides with main's: %d", sparked.Index)
-	}
 	if sparked.PublicPoint == me.PublicPoint {
 		t.Fatal("Sparked PublicPoint matches main's — derivation broken")
 	}
@@ -68,13 +62,13 @@ func TestSparkNIndependentSparks(t *testing.T) {
 	for i := 0; i < n; i++ {
 		runtime.JanosSparkForTest(func() { ch <- runtime.Identify() })
 	}
-	seen := make(map[uint64]bool)
+	seen := make(map[[64]byte]bool)
 	for i := 0; i < n; i++ {
 		id := <-ch
-		if seen[id.Index] {
-			t.Fatalf("two Sparked goroutines got the same Index: %d", id.Index)
+		if seen[id.PublicPoint] {
+			t.Fatalf("two Sparked goroutines got the same PublicPoint: %x", id.PublicPoint)
 		}
-		seen[id.Index] = true
+		seen[id.PublicPoint] = true
 	}
 }
 
@@ -118,7 +112,7 @@ func TestDerivePublicPointStableAcrossCalls(t *testing.T) {
 
 func TestDerivePublicPointMatchesRederivation(t *testing.T) {
 	me := runtime.Identify()
-	_, pub := runtime.JanosDeriveIdentityKeyForTest(me.Index)
+	_, pub := runtime.JanosDeriveIdentityKeyForTest(runtime.JanosIdentityIndexForTest(me))
 	if pub != me.PublicPoint {
 		t.Fatal("stored PublicPoint disagrees with fresh derivation from Index")
 	}
@@ -197,7 +191,7 @@ func TestDeriveCrossGoroutineRejected(t *testing.T) {
 
 func TestDeriveTamperedIndexRejected(t *testing.T) {
 	me := runtime.Identify()
-	tampered := runtime.TamperIdentityIndexForTest(me, me.Index^0xDEADBEEF)
+	tampered := runtime.TamperIdentityIndexForTest(me, runtime.JanosIdentityIndexForTest(me)^0xDEADBEEF)
 	if !runtime.IdentityBlockPointerEqualForTest(me, tampered) {
 		t.Fatal("test helper broke block pointer identity")
 	}

@@ -3,7 +3,7 @@
 // Every goroutine — main and all descendants — has an Identity from
 // birth.  The identity holds:
 //
-//   - A random 64-bit Index (public, comparable, safe as map key).
+//   - A random 64-bit derivation index (private; the derivation salt).
 //   - A P-256 public point d·G (published in Identity.PublicPoint).
 //   - A private scalar d that never leaves the runtime.
 //
@@ -33,8 +33,16 @@
 //
 // v0 note: the root key backing derivation is presently a per-process
 // random buffer generated at schedinit.  Under attestation this becomes
-// a TPM-unsealed key bound to the divined-boot PCRs, and per-goroutine
-// keys become TPM-wrapped so they are useless without that TPM.
+// a key unsealed from the host's hardware root of trust — whatever the
+// platform uses to fill that role (a TPM 2.0 device on Linux/Windows,
+// Apple's Secure Enclave on Darwin, an on-board secure element on
+// bare-metal targets) — bound to the divined-boot measurements, and
+// per-goroutine keys become wrapped by that root so they are useless
+// without the specific machine that minted them.  JanOS treats "the
+// root of trust" as a role, not a particular hardware specification:
+// the Secure Enclave and a TPM are interchangeable to the identity
+// system, and the attest package models exactly this (a role-neutral
+// API over a Mechanism that names the concrete variant).
 
 package runtime
 
@@ -77,12 +85,18 @@ type identityBlock struct {
 // goroutines that inherit the same identityBlock via `go` return
 // equal Identity values.
 type Identity struct {
-	// Index is the public integer identifier.  Safe to log, safe to
-	// use as a lookup key.
-	Index uint64
+	// index is the per-identity derivation salt.  Deliberately
+	// unexported: it is the secret input to priv = HMAC(root, index),
+	// so keeping it off the public surface means an attacker who
+	// obtains the derivation root still cannot reconstruct a scalar
+	// without also brute-forcing this 64-bit value against the public
+	// point.  Two identities are distinguished publicly by PublicPoint
+	// and compared for equality with ==; nothing outside the runtime
+	// needs the raw index.
+	index uint64
 	// PublicPoint is d·G in 64-byte uncompressed X‖Y encoding.  Safe
 	// to share with peers; ECDH partners need this to compute the
-	// shared secret.
+	// shared secret.  This is the public handle for "which identity".
 	PublicPoint [64]byte
 	// block points at the identityBlock backing this Identity.
 	// Unexported, and points at an unexported struct type — well-
@@ -114,7 +128,7 @@ func (id Identity) Derive(other ...byte) ([]byte, error) {
 	if ib == nil {
 		return nil, janosIdentityErrEmpty
 	}
-	if id.Index != ib.index || id.PublicPoint != ib.publicPoint {
+	if id.index != ib.index || id.PublicPoint != ib.publicPoint {
 		return nil, janosIdentityErrTampered
 	}
 	if getg().provenance.identity != ib {
@@ -399,7 +413,7 @@ func Identify() Identity {
 		return Identity{}
 	}
 	return Identity{
-		Index:       ib.index,
+		index:       ib.index,
 		PublicPoint: ib.publicPoint,
 		block:       ib,
 	}

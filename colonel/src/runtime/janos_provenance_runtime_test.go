@@ -319,12 +319,22 @@ func JanosDeriveIdentityKeyForTest(idx uint64) (priv [32]byte, pub [64]byte) {
 	return janosDeriveIdentityKey(idx)
 }
 
+// JanosIdentityIndexForTest exposes an Identity's unexported
+// derivation index to external tests.  The index is private in
+// production (see the Identity type doc); this helper lets the
+// re-derivation and tamper tests reach it without widening the
+// public surface.
+func JanosIdentityIndexForTest(id Identity) uint64 {
+	return id.index
+}
+
 // TamperIdentityIndexForTest returns a copy of id with a rewritten
-// Index but the same underlying block pointer.  External tests use
+// index but the same underlying block pointer.  External tests use
 // this to verify that Derive rejects the tampered value.  Cannot be
-// constructed from user code because Identity.block is unexported.
+// constructed from user code because Identity.index and Identity.block
+// are both unexported.
 func TamperIdentityIndexForTest(id Identity, newIdx uint64) Identity {
-	id.Index = newIdx
+	id.index = newIdx
 	return id
 }
 
