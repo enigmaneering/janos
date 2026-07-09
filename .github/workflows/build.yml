@@ -39,6 +39,15 @@ jobs:
       run: |
         GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 120s \
           ./colonel/src/attest/
+    - name: Run JanOS hardware-provider tests (tpm2, secureenclave)
+      run: |
+        # tpm2's live test skips without a TPM; secureenclave uses the
+        # stub on Linux (Security.framework is darwin-only) so its tests
+        # skip too.  This step confirms both packages and their test
+        # binaries build; real hardware verification is done on the
+        # target OS (Linux vTPM, macOS Secure Enclave).
+        GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -timeout 120s \
+          ./colonel/src/internal/tpm2/ ./colonel/src/internal/secureenclave/
     - name: Run JanOS toolchain tests (signet, diviner, mockdiviner)
       run: |
         GOROOT="$(pwd)/colonel" ./colonel/bin/go test -count=1 -tags janos_signtest -timeout 120s \

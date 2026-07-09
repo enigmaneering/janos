@@ -1611,6 +1611,7 @@ func (t *tester) registerRaceTests() {
 
 // cgoPackages is the standard packages that use cgo.
 var cgoPackages = []string{
+	"internal/secureenclave", // JanOS: macOS Secure Enclave provider
 	"net",
 	"os/user",
 }

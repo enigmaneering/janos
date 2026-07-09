@@ -430,6 +430,12 @@ var depsRules = `
 	< os/user
 	< archive/tar;
 
+	# internal/secureenclave uses cgo (Security.framework) on darwin;
+	# CGO covers the C import, FMT covers errors.  JanOS macOS
+	# hardware root-of-trust provider.
+	CGO, FMT
+	< internal/secureenclave;
+
 	sync
 	< internal/singleflight;
 
