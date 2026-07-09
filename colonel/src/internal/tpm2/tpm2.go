@@ -25,6 +25,7 @@ package tpm2
 import (
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // ErrNoDevice is returned by Open when no TPM transport is available
@@ -69,7 +70,17 @@ type transport interface {
 
 // Device is an open connection to a TPM 2.0.
 type Device struct {
-	t transport
+	// mu serializes all TPM access.  The TPM is a single serial
+	// engine with only a handful of transient object slots, so every
+	// logical operation (which may span a load/use/flush sequence)
+	// holds mu for its whole duration.  Internal helpers named
+	// *Locked assume the caller holds it.
+	mu sync.Mutex
+	t  transport
+	// srk is the cached storage root key handle (a transient primary
+	// under the owner hierarchy) under which all identity keys are
+	// wrapped.  0 until first use.  See key.go.
+	srk uint32
 }
 
 // Open connects to the platform TPM.  Returns ErrNoDevice if none is
@@ -82,10 +93,16 @@ func Open() (*Device, error) {
 	return &Device{t: t}, nil
 }
 
-// Close releases the transport.
+// Close flushes the cached SRK (if any) and releases the transport.
 func (d *Device) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.t == nil {
 		return nil
+	}
+	if d.srk != 0 {
+		d.flushLocked(d.srk)
+		d.srk = 0
 	}
 	return d.t.close()
 }
@@ -151,6 +168,12 @@ func (d *Device) transact(tag uint16, code uint32, params []byte) ([]byte, error
 // per call by the TPM (typically the digest size); callers needing
 // more should loop.
 func (d *Device) GetRandom(n int) ([]byte, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.getRandomLocked(n)
+}
+
+func (d *Device) getRandomLocked(n int) ([]byte, error) {
 	if n <= 0 || n > 0xFFFF {
 		return nil, fmt.Errorf("tpm2: GetRandom count %d out of range", n)
 	}
@@ -184,6 +207,8 @@ type Info struct {
 
 // Info reads the fixed-property group and assembles a TPM identity.
 func (d *Device) Info() (Info, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	props, err := d.getProperties(ptFixedPropretyBase, 32)
 	if err != nil {
 		return Info{}, err

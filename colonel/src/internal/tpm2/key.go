@@ -9,48 +9,75 @@ import (
 	"fmt"
 )
 
-// This file adds the TPM key hierarchy JanOS identities need: a P-256
-// key created inside the TPM whose private scalar never leaves it,
-// with sign and ECDH operations performed in-TPM.  It mirrors the
+// This file adds the TPM key hierarchy JanOS identities need: P-256
+// keys whose private scalar is generated inside the TPM and never
+// leaves it, with sign and ECDH performed in-TPM.  It mirrors the
 // internal/secureenclave provider — GenerateKey / PublicPoint / Sign /
 // ECDH / Close — so the two hardware roots present the same shape to
 // the identity layer.
 //
-// The key is a CreatePrimary transient in the owner hierarchy: an
-// unrestricted ECC P-256 key with sign+decrypt set, so a single key
-// serves both TPM2_Sign (ECDSA) and TPM2_ECDH_ZGen.
-
-// Structure tags and handles.
-const (
-	tagSessions uint16 = 0x8002 // TPM_ST_SESSIONS
-
-	rhOwner   uint32 = 0x40000001 // TPM_RH_OWNER
-	rhNull    uint32 = 0x40000007 // TPM_RH_NULL
-	rsPW      uint32 = 0x40000009 // TPM_RS_PW (password session)
-	stHashChk uint16 = 0x8024     // TPM_ST_HASHCHECK
-)
+// # Scaling: wrapped keys, not resident keys
+//
+// A TPM has room for only a handful of transient objects (the spec
+// floor, TPM_PT_HR_TRANSIENT_MIN, is 3) and little persistent NV, so
+// it cannot hold thousands of keys.  Neither can a Secure Enclave or
+// Pluton — they all use the same pattern: one hardware master key
+// wraps each per-key private blob, and the (encrypted, useless-off-
+// hardware) blobs live in ordinary storage.  SE/Pluton hide this
+// behind the keychain / CNG; the TPM makes us do it explicitly.
+//
+// So we keep exactly one storage root key (SRK) — a restricted
+// decrypt primary under the owner hierarchy — loaded per Device, and
+// every identity key is a TPM2_Create child wrapped under it.  The
+// wrapped blob (outPrivate + outPublic) lives in the Key, in ordinary
+// memory.  To sign or ECDH, we TPM2_Load the blob (one transient
+// slot), operate, and TPM2_FlushContext.  This scales to unlimited
+// identities with only the SRK plus one working slot resident at a
+// time; the private scalar is never usable outside the TPM.
 
 // Command codes.
 const (
 	ccCreatePrimary uint32 = 0x00000131
-	ccSign          uint32 = 0x0000015D
+	ccCreate        uint32 = 0x00000153
 	ccECDHZGen      uint32 = 0x00000154
+	ccLoad          uint32 = 0x00000157
+	ccSign          uint32 = 0x0000015D
 	ccFlushContext  uint32 = 0x00000165
 )
 
-// Algorithm and curve identifiers.
+// Structure tags and permanent handles.
 const (
-	algECC    uint16 = 0x0023
+	tagSessions uint16 = 0x8002     // TPM_ST_SESSIONS
+	rhOwner     uint32 = 0x40000001 // TPM_RH_OWNER
+	rhNull      uint32 = 0x40000007 // TPM_RH_NULL
+	rsPW        uint32 = 0x40000009 // TPM_RS_PW (password session)
+	stHashChk   uint16 = 0x8024     // TPM_ST_HASHCHECK
+)
+
+// Algorithms and curve.
+const (
+	algAES    uint16 = 0x0006
 	algSHA256 uint16 = 0x000B
-	algECDSA  uint16 = 0x0018
 	algNull   uint16 = 0x0010
+	algECDSA  uint16 = 0x0018
+	algECC    uint16 = 0x0023
+	algCFB    uint16 = 0x0043
 	eccP256   uint16 = 0x0003
 )
 
-// objectAttrECCKey: fixedTPM | fixedParent | sensitiveDataOrigin |
-// userWithAuth | decrypt | sign — an unrestricted key generated in
-// the TPM, usable for both ECDSA and ECDH.
-const objectAttrECCKey uint32 = 0x00060072
+// Object attributes.
+//
+// srkAttr: restricted | decrypt | fixedTPM | fixedParent |
+// sensitiveDataOrigin | userWithAuth — a storage parent that wraps
+// children.
+//
+// leafAttr: sign | decrypt | fixedTPM | fixedParent |
+// sensitiveDataOrigin | userWithAuth — an unrestricted key usable for
+// both TPM2_Sign and TPM2_ECDH_ZGen.
+const (
+	srkAttr  uint32 = 0x00030072
+	leafAttr uint32 = 0x00060072
+)
 
 // -- little marshalling helpers --------------------------------------
 
@@ -75,12 +102,11 @@ func pwAuthArea() []byte {
 	return b
 }
 
-// withAuth wraps a body's parameter bytes with a single authorized
-// handle and the empty-password session: handle || authSize || pwAuth
-// || params.
+// withAuth wraps params with a single authorized handle and the
+// empty-password session: handle || authSize || pwAuth || params.
 func withAuth(handle uint32, params []byte) []byte {
 	auth := pwAuthArea()
-	out := make([]byte, 0, 4+4+len(auth)+len(params))
+	out := make([]byte, 0, 8+len(auth)+len(params))
 	var h, sz [4]byte
 	putU32(h[:], handle)
 	putU32(sz[:], uint32(len(auth)))
@@ -142,84 +168,267 @@ func (c *cursor) fail() {
 	}
 }
 
-// -- Key --------------------------------------------------------------
+// -- templates --------------------------------------------------------
 
-// Key is a TPM-resident P-256 key.  The private scalar lives in the
-// TPM; PublicPoint, Sign, and ECDH operate on it without exposing it.
-// Close flushes the transient handle.
-type Key struct {
-	dev    *Device
-	handle uint32
-	pub    [64]byte
-}
-
-// eccKeyTemplate builds the TPM2B_PUBLIC for an unrestricted P-256
-// sign+decrypt key with no scheme (caller supplies the scheme at
-// sign time), NULL symmetric and KDF.  uniqueSeed is placed in the
-// unique.X buffer: CreatePrimary folds the unique field into the key
-// derivation, so a random seed makes each primary distinct (an empty
-// seed would make CreatePrimary deterministic and every key identical).
-func eccKeyTemplate(uniqueSeed []byte) []byte {
+// srkTemplate is the TPM2B_PUBLIC for the storage root key: a
+// restricted ECC P-256 decrypt parent with AES-128-CFB wrapping.  The
+// unique field is empty, so CreatePrimary yields the same SRK every
+// time on a given TPM — the stable parent under which children wrap.
+func srkTemplate() []byte {
 	var t []byte
 	var u16b [2]byte
 	put := func(v uint16) { putU16(u16b[:], v); t = append(t, u16b[:]...) }
 	var u32b [4]byte
 
-	put(algECC)    // type
-	put(algSHA256) // nameAlg
-	putU32(u32b[:], objectAttrECCKey)
-	t = append(t, u32b[:]...) // objectAttributes
-	t = append(t, tpm2b(nil)...)
-	// TPMS_ECC_PARMS: symmetric NULL, scheme NULL, curve P256, kdf NULL
-	put(algNull)
+	put(algECC)
+	put(algSHA256)
+	putU32(u32b[:], srkAttr)
+	t = append(t, u32b[:]...)
+	t = append(t, tpm2b(nil)...) // authPolicy
+	// TPMS_ECC_PARMS: symmetric AES-128-CFB, scheme NULL, P256, kdf NULL
+	put(algAES)
+	put(128)
+	put(algCFB)
 	put(algNull)
 	put(eccP256)
 	put(algNull)
-	// unique TPMS_ECC_POINT: seed in X, empty Y
-	t = append(t, tpm2b(uniqueSeed)...)
+	// unique: empty X, empty Y
+	t = append(t, tpm2b(nil)...)
 	t = append(t, tpm2b(nil)...)
 	return tpm2b(t)
 }
 
-// GenerateKey creates a fresh P-256 key inside the TPM (CreatePrimary
-// under the owner hierarchy).  The private scalar is generated in the
-// TPM and never leaves it.  Close the returned Key to flush it.
-func (d *Device) GenerateKey() (*Key, error) {
-	// A random unique seed makes each CreatePrimary distinct (the
-	// command is otherwise deterministic from the hierarchy seed +
-	// template).  Drawn from the TPM's own RNG.
-	seed, err := d.GetRandom(32)
-	if err != nil {
-		return nil, err
-	}
-	// inSensitive (empty), inPublic (template), outsideInfo (empty),
-	// creationPCR (count 0).
-	params := make([]byte, 0, 160)
-	params = append(params, tpm2b(append(tpm2b(nil), tpm2b(nil)...))...) // TPM2B_SENSITIVE_CREATE
-	params = append(params, eccKeyTemplate(seed)...)                     // inPublic
-	params = append(params, tpm2b(nil)...)                               // outsideInfo
-	params = append(params, 0, 0, 0, 0)                                  // creationPCR count 0
+// leafTemplate is the TPM2B_PUBLIC for an identity key: an
+// unrestricted ECC P-256 sign+decrypt key with no scheme (the scheme
+// is supplied at sign time), NULL symmetric and KDF, empty unique.
+// TPM2_Create generates fresh random key material each call, so no
+// unique seed is needed for distinctness.
+func leafTemplate() []byte {
+	var t []byte
+	var u16b [2]byte
+	put := func(v uint16) { putU16(u16b[:], v); t = append(t, u16b[:]...) }
+	var u32b [4]byte
 
-	body := withAuth(rhOwner, params)
+	put(algECC)
+	put(algSHA256)
+	putU32(u32b[:], leafAttr)
+	t = append(t, u32b[:]...)
+	t = append(t, tpm2b(nil)...) // authPolicy
+	// TPMS_ECC_PARMS: symmetric NULL, scheme NULL, P256, kdf NULL
+	put(algNull)
+	put(algNull)
+	put(eccP256)
+	put(algNull)
+	// unique: empty X, empty Y
+	t = append(t, tpm2b(nil)...)
+	t = append(t, tpm2b(nil)...)
+	return tpm2b(t)
+}
+
+// createParams builds the common CreatePrimary/Create parameter tail:
+// empty inSensitive, the given inPublic, empty outsideInfo, empty
+// creationPCR.
+func createParams(inPublic []byte) []byte {
+	p := make([]byte, 0, 16+len(inPublic))
+	p = append(p, tpm2b(append(tpm2b(nil), tpm2b(nil)...))...) // TPM2B_SENSITIVE_CREATE
+	p = append(p, inPublic...)
+	p = append(p, tpm2b(nil)...) // outsideInfo
+	p = append(p, 0, 0, 0, 0)    // creationPCR count 0
+	return p
+}
+
+// -- SRK --------------------------------------------------------------
+
+// ensureSRKLocked creates and caches the storage root key if it is not
+// already loaded.  Caller holds d.mu.
+func (d *Device) ensureSRKLocked() error {
+	if d.srk != 0 {
+		return nil
+	}
+	body := withAuth(rhOwner, createParams(srkTemplate()))
 	resp, err := d.transact(tagSessions, ccCreatePrimary, body)
 	if err != nil {
+		return err
+	}
+	c := &cursor{b: resp}
+	handle := c.u32() // objectHandle
+	if c.err != nil {
+		return c.err
+	}
+	d.srk = handle
+	return nil
+}
+
+// -- Key --------------------------------------------------------------
+
+// Key is a TPM-wrapped P-256 identity key.  It holds only the wrapped
+// blob (the private area encrypted under the SRK, plus the public
+// area) in ordinary memory — nothing resident in the TPM.  Operations
+// load the blob into the TPM transiently.  The private scalar is never
+// usable outside the TPM.
+type Key struct {
+	dev     *Device
+	priv    []byte   // outPrivate content (wrapped sensitive area)
+	pubArea []byte   // outPublic content (TPMT_PUBLIC), re-wrapped on load
+	pub     [64]byte // parsed public point
+}
+
+// GenerateKey creates a fresh P-256 key wrapped under the device's
+// storage root key.  The private scalar is generated inside the TPM;
+// only the wrapped blob and public point come back.  Scales to any
+// number of keys — each is just a blob in memory.
+func (d *Device) GenerateKey() (*Key, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.ensureSRKLocked(); err != nil {
 		return nil, err
 	}
-	// Response: objectHandle || parameterSize || outPublic || ...
+	body := withAuth(d.srk, createParams(leafTemplate()))
+	resp, err := d.transact(tagSessions, ccCreate, body)
+	if err != nil {
+		return nil, err
+	}
+	// Response: parameterSize || outPrivate || outPublic || ...
 	c := &cursor{b: resp}
-	handle := c.u32()
 	c.u32() // parameterSize
-	outPublic := c.tpm2b()
+	priv := c.tpm2b()
+	pubArea := c.tpm2b()
 	if c.err != nil {
 		return nil, c.err
 	}
-	pub, err := parseECCPublic(outPublic)
+	pub, err := parseECCPublic(pubArea)
 	if err != nil {
-		// Best-effort flush of the handle we can't use.
-		d.flush(handle)
 		return nil, err
 	}
-	return &Key{dev: d, handle: handle, pub: pub}, nil
+	// Copy out of the response buffer, which is reused per transact.
+	return &Key{
+		dev:     d,
+		priv:    append([]byte(nil), priv...),
+		pubArea: append([]byte(nil), pubArea...),
+		pub:     pub,
+	}, nil
+}
+
+// loadLocked loads the key's wrapped blob under the SRK and returns
+// the transient handle.  Caller holds d.mu and must flush the handle.
+func (d *Device) loadLocked(k *Key) (uint32, error) {
+	if err := d.ensureSRKLocked(); err != nil {
+		return 0, err
+	}
+	params := append(tpm2b(k.priv), tpm2b(k.pubArea)...)
+	resp, err := d.transact(tagSessions, ccLoad, withAuth(d.srk, params))
+	if err != nil {
+		return 0, err
+	}
+	c := &cursor{b: resp}
+	handle := c.u32() // objectHandle
+	if c.err != nil {
+		return 0, c.err
+	}
+	return handle, nil
+}
+
+// PublicPoint returns the key's public point as 64 bytes of
+// uncompressed X||Y.
+func (k *Key) PublicPoint() ([64]byte, error) {
+	if k.dev == nil {
+		return [64]byte{}, errors.New("tpm2: key is closed")
+	}
+	return k.pub, nil
+}
+
+// Sign produces an ECDSA signature over a 32-byte SHA-256 digest,
+// computed in the TPM.  Returned as raw r||s (64 bytes).
+func (k *Key) Sign(digest []byte) ([]byte, error) {
+	if k.dev == nil {
+		return nil, errors.New("tpm2: key is closed")
+	}
+	if len(digest) != 32 {
+		return nil, errors.New("tpm2: Sign expects a 32-byte SHA-256 digest")
+	}
+	d := k.dev
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	handle, err := d.loadLocked(k)
+	if err != nil {
+		return nil, err
+	}
+	defer d.flushLocked(handle)
+
+	params := make([]byte, 0, 64)
+	params = append(params, tpm2b(digest)...)
+	var scheme [4]byte // inScheme: ECDSA + SHA256
+	putU16(scheme[0:2], algECDSA)
+	putU16(scheme[2:4], algSHA256)
+	params = append(params, scheme[:]...)
+	var vtk [6]byte // validation: TPMT_TK_HASHCHECK, hierarchy NULL
+	putU16(vtk[0:2], stHashChk)
+	putU32(vtk[2:6], rhNull)
+	params = append(params, vtk[:]...)
+	params = append(params, tpm2b(nil)...)
+
+	resp, err := d.transact(tagSessions, ccSign, withAuth(handle, params))
+	if err != nil {
+		return nil, err
+	}
+	// Response: parameterSize || sigAlg || hash || sigR || sigS || ...
+	c := &cursor{b: resp}
+	c.u32()   // parameterSize
+	c.skip(2) // sigAlg (ECDSA)
+	c.skip(2) // hash (SHA256)
+	r := c.tpm2b()
+	s := c.tpm2b()
+	if c.err != nil {
+		return nil, c.err
+	}
+	out := make([]byte, 64)
+	copy(out[32-len(r):32], r)
+	copy(out[64-len(s):64], s)
+	return out, nil
+}
+
+// ECDH computes the ECDH shared secret between this key and a peer's
+// public point (64-byte uncompressed X||Y), returning the 32-byte
+// shared X coordinate.  The scalar multiplication happens in the TPM.
+func (k *Key) ECDH(peerPoint [64]byte) ([]byte, error) {
+	if k.dev == nil {
+		return nil, errors.New("tpm2: key is closed")
+	}
+	d := k.dev
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	handle, err := d.loadLocked(k)
+	if err != nil {
+		return nil, err
+	}
+	defer d.flushLocked(handle)
+
+	inner := append(tpm2b(peerPoint[:32]), tpm2b(peerPoint[32:])...)
+	params := tpm2b(inner) // TPM2B_ECC_POINT
+
+	resp, err := d.transact(tagSessions, ccECDHZGen, withAuth(handle, params))
+	if err != nil {
+		return nil, err
+	}
+	// Response: parameterSize || outPoint size || X || Y || ...
+	c := &cursor{b: resp}
+	c.u32() // parameterSize
+	c.u16() // outPoint size
+	x := c.tpm2b()
+	if c.err != nil {
+		return nil, c.err
+	}
+	out := make([]byte, 32)
+	copy(out[32-len(x):32], x)
+	return out, nil
+}
+
+// Close marks the key unusable.  There is no TPM handle to release —
+// the key is only ever loaded transiently during an operation — so
+// this just drops the device reference.  Safe to call more than once.
+func (k *Key) Close() error {
+	k.dev = nil
+	return nil
 }
 
 // parseECCPublic walks a TPMT_PUBLIC and returns the 64-byte X||Y of
@@ -243,106 +452,15 @@ func parseECCPublic(pub []byte) ([64]byte, error) {
 	if len(x) > 32 || len(y) > 32 {
 		return out, fmt.Errorf("tpm2: ECC point coordinate too large (x=%d y=%d)", len(x), len(y))
 	}
-	// Right-align each coordinate into its 32-byte field (the TPM may
-	// drop a leading zero byte).
+	// Right-align each coordinate (the TPM may drop a leading zero).
 	copy(out[32-len(x):32], x)
 	copy(out[64-len(y):64], y)
 	return out, nil
 }
 
-// PublicPoint returns the key's public point as 64 bytes of
-// uncompressed X||Y.
-func (k *Key) PublicPoint() ([64]byte, error) {
-	if k.dev == nil {
-		return [64]byte{}, errors.New("tpm2: key is closed")
-	}
-	return k.pub, nil
-}
-
-// Sign produces an ECDSA signature over a 32-byte SHA-256 digest,
-// computed in the TPM.  The signature is returned as raw r||s (64
-// bytes).
-func (k *Key) Sign(digest []byte) ([]byte, error) {
-	if k.dev == nil {
-		return nil, errors.New("tpm2: key is closed")
-	}
-	if len(digest) != 32 {
-		return nil, errors.New("tpm2: Sign expects a 32-byte SHA-256 digest")
-	}
-	params := make([]byte, 0, 64)
-	params = append(params, tpm2b(digest)...) // digest
-	var scheme [4]byte                        // inScheme: ECDSA + SHA256
-	putU16(scheme[0:2], algECDSA)
-	putU16(scheme[2:4], algSHA256)
-	params = append(params, scheme[:]...)
-	// validation: TPMT_TK_HASHCHECK with hierarchy NULL, empty digest.
-	var vtk [6]byte
-	putU16(vtk[0:2], stHashChk)
-	putU32(vtk[2:6], rhNull)
-	params = append(params, vtk[:]...)
-	params = append(params, tpm2b(nil)...)
-
-	resp, err := k.dev.transact(tagSessions, ccSign, withAuth(k.handle, params))
-	if err != nil {
-		return nil, err
-	}
-	// Response: parameterSize || TPMT_SIGNATURE || ...
-	c := &cursor{b: resp}
-	c.u32()   // parameterSize
-	c.skip(2) // sigAlg (ECDSA)
-	c.skip(2) // hash (SHA256)
-	r := c.tpm2b()
-	s := c.tpm2b()
-	if c.err != nil {
-		return nil, c.err
-	}
-	out := make([]byte, 64)
-	copy(out[32-len(r):32], r)
-	copy(out[64-len(s):64], s)
-	return out, nil
-}
-
-// ECDH computes the ECDH shared secret between this key and a peer's
-// public point (64-byte uncompressed X||Y), returning the 32-byte
-// shared X coordinate.  The scalar multiplication happens in the TPM.
-func (k *Key) ECDH(peerPoint [64]byte) ([]byte, error) {
-	if k.dev == nil {
-		return nil, errors.New("tpm2: key is closed")
-	}
-	// inPoint: TPM2B_ECC_POINT wrapping X||Y as two TPM2Bs.
-	inner := append(tpm2b(peerPoint[:32]), tpm2b(peerPoint[32:])...)
-	params := tpm2b(inner)
-
-	resp, err := k.dev.transact(tagSessions, ccECDHZGen, withAuth(k.handle, params))
-	if err != nil {
-		return nil, err
-	}
-	// Response: parameterSize || outPoint (TPM2B_ECC_POINT) || ...
-	c := &cursor{b: resp}
-	c.u32() // parameterSize
-	c.u16() // outPoint size
-	x := c.tpm2b()
-	if c.err != nil {
-		return nil, c.err
-	}
-	out := make([]byte, 32)
-	copy(out[32-len(x):32], x)
-	return out, nil
-}
-
-// Close flushes the TPM's transient handle for this key.  Safe to
-// call more than once.
-func (k *Key) Close() error {
-	if k.dev == nil {
-		return nil
-	}
-	err := k.dev.flush(k.handle)
-	k.dev = nil
-	return err
-}
-
-// flush issues TPM2_FlushContext for a transient handle.
-func (d *Device) flush(handle uint32) error {
+// flushLocked issues TPM2_FlushContext for a transient handle.  Caller
+// holds d.mu.
+func (d *Device) flushLocked(handle uint32) error {
 	var h [4]byte
 	putU32(h[:], handle)
 	_, err := d.transact(tagNoSessions, ccFlushContext, h[:])

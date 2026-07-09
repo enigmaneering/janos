@@ -312,3 +312,54 @@ func TestKeyLive(t *testing.T) {
 		t.Errorf("ECDH shared secret = %d bytes, want 32", len(ab))
 	}
 }
+
+// TestKeyScaling proves the wrapped model scales past the TPM's
+// transient-slot limit (spec floor is 3).  It generates far more keys
+// than could ever be resident, keeps them all "open" (they are just
+// blobs in memory), and verifies every one still signs correctly —
+// which the CreatePrimary-per-key model could not do.
+func TestKeyScaling(t *testing.T) {
+	dev, err := Open()
+	if err == ErrNoDevice {
+		t.Skip("no TPM device on this host")
+	}
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer dev.Close()
+
+	const n = 12 // well past TPM_PT_HR_TRANSIENT_MIN (3)
+	keys := make([]*Key, 0, n)
+	defer func() {
+		for _, k := range keys {
+			k.Close()
+		}
+	}()
+	for i := 0; i < n; i++ {
+		k, err := dev.GenerateKey()
+		if err != nil {
+			t.Fatalf("GenerateKey %d/%d: %v", i+1, n, err)
+		}
+		keys = append(keys, k)
+	}
+
+	// Every key — including ones generated long before the last — must
+	// still sign verifiably, proving none were evicted or lost.
+	digest := sha256.Sum256([]byte("scaling"))
+	for i, k := range keys {
+		pt, _ := k.PublicPoint()
+		x := new(big.Int).SetBytes(pt[:32])
+		y := new(big.Int).SetBytes(pt[32:])
+		pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}
+		sig, err := k.Sign(digest[:])
+		if err != nil {
+			t.Fatalf("Sign key %d: %v", i, err)
+		}
+		r := new(big.Int).SetBytes(sig[:32])
+		s := new(big.Int).SetBytes(sig[32:])
+		if !ecdsa.Verify(pub, digest[:], r, s) {
+			t.Fatalf("key %d/%d signature did not verify", i, n)
+		}
+	}
+	t.Logf("%d wrapped keys all signed verifiably (transient slots never exhausted)", n)
+}
